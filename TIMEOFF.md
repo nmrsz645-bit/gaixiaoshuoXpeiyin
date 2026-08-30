@@ -1,6 +1,6 @@
 # 小说处理中心工作交接
 
-更新时间：2026-08-30（Asia/Shanghai）  
+更新时间：2026-08-31（Asia/Shanghai）  
 项目根目录：`E:\自动化\改小说+配音`
 
 > 本文是当前工作的唯一交接入口。接手者无需阅读历史聊天，但必须先完整阅读本文。线上正式版本已为 **1.0.15**：新增“超 59 分钟 MP3 自动保留前 35 分钟”，已完成独立构建、递归包审计、真实媒体验证、隔离升级/回滚、激活后三入口公网回读。现有配置、数据、日志、程序和 1.0.14 记录均保留；后续发布必须以新版本号和同等级验证进行，禁止覆盖既有版本文件。
@@ -8,14 +8,14 @@
 ## 接手首要状态（以本节为准）
 
 - 权威源码：`E:\自动化\改小说+配音` 根目录与 `novel_monitor\`。线上当前版本为 `1.0.15`，不应重复发布。
-- Git：本地 `main` 已完成安全暂存，远端为 `https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git`；**尚未首提交和推送**，原因是本机 Git 未配置提交者姓名和邮箱。因此其他电脑暂不能从 Git 克隆到源码。
-- 新电脑开发接手：待首推后，在 Windows + Python 3.13 环境克隆仓库、安装 `requirements.txt`、执行 `运行回归测试.bat`，并在 GitHub Actions 确认 `Offline regression` 绿灯。该测试不使用真实 Key 或收费接口。
+- Git：本地与远端 `main` 已完成首次推送，首个提交为 `75ff2e0`，远端为 `https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git`。用户配置、数据、日志和密钥均未进入仓库。
+- 新电脑开发接手：在 Windows + Python 3.13 环境克隆仓库、安装 `requirements.txt`、执行 `运行回归测试.bat`，并在 GitHub Actions 确认 `Offline regression` 绿灯。该测试不使用真实 Key 或收费接口。
 - 新电脑直接使用：使用已发布的 `1.0.15` 完整包；Git 不迁移用户 Key、配置、小说、MP3、日志和队列。新机器必须自行配置，或经用户明确同意后安全迁移这些数据。
 - 旧段落中的 `1.0.14`/`64 项测试`均为历史证据；当前回归基线为 **66 项**，当前发布版本为 **1.0.15**。
 
-## 2026-08-30 Git 交接与离线回归（已完成）
+## 2026-08-31 Git 交接与离线回归（已完成）
 
-- 权威源码 `E:\自动化\改小说+配音` 已初始化 Git，默认分支为 `main`，远端为 `https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git`；首次提交尚待本机 Git 作者姓名和邮箱配置后执行。
+- 权威源码 `E:\自动化\改小说+配音` 已初始化 Git，默认分支为 `main`，远端为 `https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git`；已使用仅限本仓库的 Git 作者配置完成首次提交与推送。
 - 新增 `.gitignore`，明确排除真实配置、Key、Webhook、规则、小说、音频、日志、回执、统计、构建/发布/隔离验证目录和历史备份；已审计暂存源码清单，敏感 Key 特征扫描为 0。
 - 新增 `README.md`、`AGENTS.md`、`.env.example`，新电脑接手必须先读这三份文件和本文。
 - 新增 `运行回归测试.bat` 与 `.github/workflows/offline-regression.yml`：Windows/Python 3.13 下执行语法检查与 `python -m unittest test_pipeline.py`。CI 仅跑离线测试，不读取密钥、不调用真实 AI/TTS、不上传 OSS 或发布更新。

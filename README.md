@@ -8,7 +8,7 @@ Windows 本地“小说改写 + 自动配音”程序。处理流程为：
 
 开发和运行环境为 **Windows + Python 3.13**。真实配置和业务文件不会随 Git 迁移。
 
-> 当前本机源码已安全暂存，但仍待首次提交并推送；在首推完成前，另一台电脑请使用已发布的 1.0.15 完整包，不能从这个空 GitHub 仓库获得源码。首推完成后，再按下面步骤开发接手。
+> 源码已推送到 GitHub `main` 分支。另一台电脑可按下面步骤克隆并接手开发；直接使用仍请优先使用已发布的 1.0.15 完整包。Git 不会迁移真实配置、接口 Key、小说、音频和日志。
 
 ```powershell
 git clone https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git
