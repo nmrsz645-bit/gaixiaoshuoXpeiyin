@@ -5,6 +5,73 @@
 
 > 本文是当前工作的唯一交接入口。接手者无需阅读历史聊天，但必须先完整阅读本文。线上正式版本已为 **1.0.15**：新增“超 59 分钟 MP3 自动保留前 35 分钟”，已完成独立构建、递归包审计、真实媒体验证、隔离升级/回滚、激活后三入口公网回读。现有配置、数据、日志、程序和 1.0.14 记录均保留；后续发布必须以新版本号和同等级验证进行，禁止覆盖既有版本文件。
 
+## 新会话完整交接（2026-08-31，以本节为准）
+
+### 当前目标
+
+当前没有获批的业务功能修改或发布任务。源码、跨电脑开发接手和离线回归已经完成；下一会话应先核对状态、报告理解结果，再等待用户明确授权后才改代码、启动正式队列、调用收费接口或发布更新。
+
+### 已完成并验证
+
+- 权威源码在 `E:\自动化\改小说+配音`，远端仓库为 `https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git`，分支为 `main`；本地与远端已完成安全推送。
+- 新电脑实测路径已完成：全新克隆 → Python 3.13 `.venv` → 安装 `requirements.txt` → `run_tests.bat` 与 `运行回归测试.bat` 各跑一次，均为 `Ran 66 tests`、`OK`；`unified_app` 与 `voice_monitor` 均可导入。
+- 最新已核对的 GitHub Actions 工作流成功：`Offline regression` run `33321832529`，提交 `eb0b5f8`。CI 不读取 Key，不调用真实 AI/TTS，不发布更新。
+- 线上正式版本为 `1.0.15`：仅对**新生成**、时长超过 59 分钟的 MP3 保留前 35 分钟；历史成品不回头修改。原始发布、升级/回滚和公网回读证据见后文。
+- `.gitignore`、暂存审计和全新克隆均确认：真实配置、Key、Webhook、小说、音频、日志、回执、统计、构建和验证目录未进入仓库。
+
+### 未完成事项
+
+1. 没有待修复的已知业务代码问题。
+2. 新机器首次真实使用时必须在 GUI 填写自己的 AI/TTS/Webhook 配置；这些数据按设计不随 Git 迁移。
+3. 新会话如需改代码、真实 AI/TTS 验收、构建、OSS 发布、更新清单或通知用户，必须先取得用户明确授权；本交接不授权这些操作。
+
+### 下一步具体操作（新会话第一条，直接执行；只读）
+
+```powershell
+Set-Location -LiteralPath 'E:\自动化\改小说+配音'
+git fetch origin
+git status --short
+git rev-parse HEAD
+git rev-parse origin/main
+```
+
+预期：`git status --short` 无输出，且两个提交号相同。随后向用户报告当前目标、状态和风险，等待下一条明确指令；不要自行修改程序或启动正式任务。
+
+### 关键文件与路径
+
+- `unified_app.py`：统一 GUI、设置、服务生命周期、接口测试和更新入口。
+- `voice_monitor.py`：配音、失败重试、MP3 时长限制（59 分钟以上裁为前 35 分钟）。
+- `novel_monitor\`：改写配置、DeepSeek 请求、改写任务与监控服务。
+- `test_pipeline.py`：66 项离线回归。
+- `run_tests.bat`：英文稳定回归入口；`运行回归测试.bat`：中文兼容入口；二者优先使用 `.venv`。
+- `README.md`：新电脑克隆与运行说明；`AGENTS.md`：接手约定；`.github\workflows\offline-regression.yml`：云端离线回归。
+
+### 运行与验证命令
+
+新电脑开发接手：
+
+```powershell
+git clone https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git
+cd gaixiaoshuoXpeiyin
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+cmd /c run_tests.bat
+```
+
+通过后可用 `.\.venv\Scripts\python.exe unified_app.py` 或双击 `启动小说处理中心.bat` 启动；先填写本机配置，再按用户授权处理小说。
+
+### 已知问题与边界
+
+- 本机系统全局 Python 的 `requests` 依赖曾损坏；项目 `.venv` 已验证可用，启动与测试脚本会优先使用它。
+- 离线回归不等于真实收费接口验收；本次跨电脑验证未使用任何 Key，未产生 AI/TTS 费用。
+- 已发布完整包可供直接使用，但源码 Git 只用于开发接手，不携带任何用户运行数据。
+
+### 不能误动的数据与配置
+
+- 不得删除、移动、覆盖或提交 `config.json`、`改写\`、`待改小说\`、`已改完成\`、`完成\`、`改写失败\`、`配音失败\`、`试听\`、`随机音色\`、`.voice-receipts\`、`每日统计.json`、日志、回执、处理中目录和用户自定义输出目录。
+- 不得读取、展示、提交或写入 API Key、阿里云 AccessKey、Webhook、Token、密码或临时测试凭据。
+- 不得把 `发布版-*`、`发布候选-*`、`隔离验证-*`、`源码备份-*`、`app.previous*` 或任何用户数据并入源码仓库/新包；不得修改旧项目 `E:\自动化\改小说`。
+
 ## 接手首要状态（以本节为准）
 
 - 权威源码：`E:\自动化\改小说+配音` 根目录与 `novel_monitor\`。线上当前版本为 `1.0.15`，不应重复发布。
