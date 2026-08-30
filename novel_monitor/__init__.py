@@ -1,0 +1,1 @@
+"""Novel monitor package."""

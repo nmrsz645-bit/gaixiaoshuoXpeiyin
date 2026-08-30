@@ -1,0 +1,34 @@
+# 用户配置、凭据与运行状态
+config.json
+每日统计.json
+voice_monitor.log*
+*.log
+.voice-receipts/
+data/
+改写/
+待改小说/
+已改完成/
+完成/
+改写失败/
+配音失败/
+试听/
+随机音色/
+停止守护.flag
+
+# Python 缓存与本地环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.ci-deps*/
+
+# 构建、发布、验证与历史备份
+build*/
+dist/
+发布版*/
+发布候选*/
+隔离构建*/
+隔离验证*/
+源码备份*/
+app.previous*/

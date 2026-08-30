@@ -1,0 +1,17 @@
+{
+  "appId": "xiao-shuo-chu-li-zhong-xin",
+  "manifestUrl": "https://luotuoruanjiangengx.oss-cn-beijing.aliyuncs.com/updates/xiao-shuo-chu-li-zhong-xin/latest.json",
+  "appRoot": "..\\app",
+  "versionFile": "version.json",
+  "restartExecutable": "小说处理中心.exe",
+  "excludePaths": ["version.json"],
+  "preservePaths": ["*"],
+  "requiredFiles": [
+    "version.json",
+    "小说处理中心.exe",
+    "Start-App.cmd",
+    "_internal\\python313.dll",
+    "_internal\\certifi\\cacert.pem",
+    "_internal\\aliyunsdkcore\\vendored\\requests\\packages\\certifi\\cacert.pem"
+  ]
+}
