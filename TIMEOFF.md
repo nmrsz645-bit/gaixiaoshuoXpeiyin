@@ -20,6 +20,7 @@
 - 新增 `README.md`、`AGENTS.md`、`.env.example`，新电脑接手必须先读这三份文件和本文。
 - 新增 `run_tests.bat`（英文稳定入口）、`运行回归测试.bat`（中文兼容入口）与 `.github/workflows/offline-regression.yml`：Windows/Python 3.13 下执行语法检查与 `python -m unittest test_pipeline.py`。CI 仅跑离线测试，不读取密钥、不调用真实 AI/TTS、不上传 OSS 或发布更新。
 - 已优化交接表述：后文 2026-08-21 的记录均已显式标为历史快照，不能再用其中的 `1.0.14`、`64 项测试`或“不是 Git 仓库”判断当前状态；当前状态只以本文顶部和本节为准。
+- 已做全新克隆实测：新目录安装 `requirements.txt` 后，`run_tests.bat` 与 `运行回归测试.bat` 均为 66 项通过，`unified_app`、`voice_monitor` 可导入；最新 CI Job `99284043811` 也已成功。测试未填写 Key，未调用真实 AI/TTS。
 
 ## 2026-08-21 19:08 MP3 超时长自动裁剪正式发布（1.0.15，已完成）
 
