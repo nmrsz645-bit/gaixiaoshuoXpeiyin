@@ -26,9 +26,9 @@ python -m py_compile unified_app.py voice_monitor.py test_pipeline.py
 python -m unittest test_pipeline.py
 ```
 
-Windows 上也可双击 `运行回归测试.bat`。GitHub Actions 会对每次推送和 Pull Request 运行同一套离线回归；它不读取 Key、不调用真实 AI/TTS，也不发布更新。
+Windows 上可运行 `run_tests.bat`；`运行回归测试.bat` 保留为中文兼容入口。GitHub Actions 会对每次推送和 Pull Request 运行同一套离线回归；它不读取 Key、不调用真实 AI/TTS，也不发布更新。
 
-首次提交并推送后，在 GitHub 的 **Actions** 页面确认 `Offline regression` 绿灯，才算新电脑开发环境可复现。克隆后的首次操作应为 `python -m pip install -r requirements.txt`，再运行 `运行回归测试.bat`；通过后才填写自己的接口配置并启动程序。
+首次提交并推送后，在 GitHub 的 **Actions** 页面确认 `Offline regression` 绿灯，才算新电脑开发环境可复现。克隆后的首次操作应为 `python -m pip install -r requirements.txt`，再运行 `run_tests.bat`；通过后才填写自己的接口配置并启动程序。
 
 构建桌面候选使用 `构建桌面版.bat`。正式发布前必须完整阅读 `TIMEOFF.md`，并遵守其中的隔离构建、用户数据保护、升级回滚和公网回读要求。
 

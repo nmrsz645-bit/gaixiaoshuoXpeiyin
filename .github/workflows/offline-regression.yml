@@ -21,4 +21,4 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
-      - run: cmd /c 运行回归测试.bat
+      - run: cmd /c run_tests.bat
