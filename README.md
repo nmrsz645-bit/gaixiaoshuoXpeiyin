@@ -13,8 +13,9 @@ Windows 本地“小说改写 + 自动配音”程序。处理流程为：
 ```powershell
 git clone https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin.git
 cd gaixiaoshuoXpeiyin
-python -m pip install -r requirements.txt
-python unified_app.py
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe unified_app.py
 ```
 
 也可运行 `启动小说处理中心.bat`。首次启动后，在“改小说设置”和“配音设置”中填写自己的接口配置；真实 Key、Webhook 和用户配置不属于 Git 仓库。若要迁移业务数据，应在用户明确同意后，单独、安全地复制配置、规则、小说与音频，绝不提交到 Git。
@@ -28,7 +29,7 @@ python -m unittest test_pipeline.py
 
 Windows 上可运行 `run_tests.bat`；`运行回归测试.bat` 保留为中文兼容入口。GitHub Actions 会对每次推送和 Pull Request 运行同一套离线回归；它不读取 Key、不调用真实 AI/TTS，也不发布更新。
 
-首次提交并推送后，在 GitHub 的 **Actions** 页面确认 `Offline regression` 绿灯，才算新电脑开发环境可复现。克隆后的首次操作应为 `python -m pip install -r requirements.txt`，再运行 `run_tests.bat`；通过后才填写自己的接口配置并启动程序。
+首次提交并推送后，在 GitHub 的 **Actions** 页面确认 `Offline regression` 绿灯，才算新电脑开发环境可复现。克隆后的首次操作应为 `py -3.13 -m venv .venv`、安装 `requirements.txt`，再运行 `run_tests.bat`；脚本会优先使用 `.venv`。通过后才填写自己的接口配置并启动程序。
 
 构建桌面候选使用 `构建桌面版.bat`。正式发布前必须完整阅读 `TIMEOFF.md`，并遵守其中的隔离构建、用户数据保护、升级回滚和公网回读要求。
 
