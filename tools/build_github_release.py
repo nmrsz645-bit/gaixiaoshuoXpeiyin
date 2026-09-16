@@ -69,10 +69,10 @@ def main() -> None:
             raise RuntimeError(f"packaging did not produce {APP_NAME}")
         (app / "version.json").write_text(json.dumps({"version": args.version}, ensure_ascii=False), encoding="utf-8")
         (app / "Start-App.cmd").write_text(
-            '@echo off\r\nstart "" "%~dp0小说处理中心.exe"\r\n', encoding="utf-8"
+            '@echo off\r\nfor %%F in ("%~dp0*.exe") do start "" "%%~fF"\r\n', encoding="utf-8"
         )
         (output / "Start-App.cmd").write_text(
-            '@echo off\r\nstart "" "%~dp0app\\小说处理中心.exe"\r\n', encoding="utf-8"
+            '@echo off\r\nfor %%F in ("%~dp0app\\*.exe") do start "" "%%~fF"\r\n', encoding="utf-8"
         )
 
         app_zip = output / "app.zip"

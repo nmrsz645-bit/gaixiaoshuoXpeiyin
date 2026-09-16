@@ -41,7 +41,7 @@ Windows 上可运行 `run_tests.bat`；`运行回归测试.bat` 保留为中文�
 
 - `app.zip`：已安装用户自动下载的更新包；
 - `latest.json`：版本、SHA-256 与下载地址清单；
-- `novel-processing-center-<版本>-windows-x64.zip`：给新电脑首次安装的完整包。
+- `novel-processing-center-<版本>-windows-x64.zip`：给新电脑首次安装的完整包；解压后双击 `Start-App.cmd` 启动。
 
 客户端固定读取仓库最新 Release 的 `latest.json`；后续只要发布更高版本标签，已安装客户端就会发现并安装属于本程序的更新。仓库须保持公开，或另行给更新器配置可公开读取的下载地址。
 
