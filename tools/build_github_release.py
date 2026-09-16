@@ -77,7 +77,7 @@ def main() -> None:
 
         app_zip = output / "app.zip"
         archive_tree(app, app_zip)
-        full_zip = output / f"小说处理中心-{args.version}-windows-x64.zip"
+        full_zip = output / f"novel-processing-center-{args.version}-windows-x64.zip"
         with zipfile.ZipFile(full_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             for path in sorted(item for item in app.rglob("*") if item.is_file()):
                 archive.write(path, (Path("app") / path.relative_to(app)).as_posix())
