@@ -1469,6 +1469,14 @@ class PipelineTests(unittest.TestCase):
             self.assertIsNone(result)
             runner.assert_not_called()
 
+    def test_bundled_updater_reads_the_latest_github_release_manifest(self):
+        config_path = Path(__file__).resolve().parent / "updater-patch" / "updater-config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            config["manifestUrl"],
+            "https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/latest/download/latest.json",
+        )
+
     def test_stop_in_progress_rejects_restart_until_worker_exits(self):
         entered = threading.Event()
         release = threading.Event()

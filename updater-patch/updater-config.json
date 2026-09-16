@@ -1,6 +1,6 @@
 {
   "appId": "xiao-shuo-chu-li-zhong-xin",
-  "manifestUrl": "https://luotuoruanjiangengx.oss-cn-beijing.aliyuncs.com/updates/xiao-shuo-chu-li-zhong-xin/latest.json",
+  "manifestUrl": "https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/latest/download/latest.json",
   "appRoot": "..\\app",
   "versionFile": "version.json",
   "restartExecutable": "小说处理中心.exe",
