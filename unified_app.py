@@ -27,6 +27,7 @@ from novel_monitor.deepseek_client import (
     DEFAULT_AD_COMPLIANCE_RULES,
     DEFAULT_BANNED_TERMS,
     RULES_FILE_NAME,
+    is_aliyun_bailian_url,
     is_deepseek_official_url,
 )
 from novel_monitor.logging_setup import setup_logging
@@ -85,7 +86,19 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
+BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
+OFFICIAL_MODEL = "deepseek-v4-flash"
+BAILIAN_MODEL_CHOICES = ("deepseek-v4-flash-0731", "qwen3.8-flash")
+MODEL_CHOICES = (OFFICIAL_MODEL, *BAILIAN_MODEL_CHOICES)
+
+
+def ai_service_for_url(url: str) -> str:
+    if is_deepseek_official_url(url):
+        return OFFICIAL_AI_SERVICE
+    if is_aliyun_bailian_url(url):
+        return BAILIAN_AI_SERVICE
+    return CUSTOM_AI_SERVICE
 
 
 def acquire_single_instance() -> bool:
@@ -321,6 +334,8 @@ def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.pos
         request_body = {"model": model, "messages": [{"role": "user", "content": "Reply OK."}], "max_tokens": 32}
         if is_deepseek_official_url(api_url):
             request_body["thinking"] = {"type": "disabled"}
+        elif is_aliyun_bailian_url(api_url):
+            request_body["enable_thinking"] = False
         response = ai_post(api_url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=request_body, timeout=30)
         response.raise_for_status()
         results["AI"] = "正常"
@@ -395,7 +410,7 @@ def ensure_app_files() -> None:
                 "stableSeconds": 15,
                 "retryIntervalMinutes": 20,
                 "maxRetries": 3,
-                "deepseekModel": "deepseek-v4-flash",
+                "deepseekModel": OFFICIAL_MODEL,
                 "maxRequestChars": 8000,
                 "requestTimeoutSeconds": 300,
             },
@@ -631,15 +646,15 @@ class App(tk.Tk):
         self.rewrite_url = tk.StringVar(value=self.read_text(REWRITE_DIR / "ai_api_url.txt") or DEFAULT_AI_URL)
         self.webhook = tk.StringVar(value=self.read_text(REWRITE_DIR / "wechat_webhook_url.txt"))
         data = self.read_json(REWRITE_DIR / "config.json")
-        self.model = tk.StringVar(value=data.get("deepseekModel", "deepseek-v4-flash"))
-        self.ai_service = tk.StringVar(value=OFFICIAL_AI_SERVICE if is_deepseek_official_url(self.rewrite_url.get()) else CUSTOM_AI_SERVICE)
+        self.model = tk.StringVar(value=data.get("deepseekModel", OFFICIAL_MODEL))
+        self.ai_service = tk.StringVar(value=ai_service_for_url(self.rewrite_url.get()))
         self.max_request_chars = tk.StringVar(value=str(data.get("maxRequestChars", 8000)))
         self.request_timeout_seconds = tk.StringVar(value=str(data.get("requestTimeoutSeconds", 300)))
         ttk.Label(page, text="待改小说 TXT 文件夹").grid(row=0, column=0, sticky="w", pady=5)
         ttk.Entry(page, textvariable=self.source_dir, width=64).grid(row=0, column=1, sticky="ew", pady=5)
         ttk.Button(page, text="选择文件夹", command=self.choose_source_dir).grid(row=0, column=2, padx=(6, 0), pady=5)
         ttk.Label(page, text="AI 服务").grid(row=1, column=0, sticky="w", pady=5)
-        service_box = ttk.Combobox(page, textvariable=self.ai_service, values=(OFFICIAL_AI_SERVICE, CUSTOM_AI_SERVICE), state="readonly", width=30)
+        service_box = ttk.Combobox(page, textvariable=self.ai_service, values=(OFFICIAL_AI_SERVICE, BAILIAN_AI_SERVICE, CUSTOM_AI_SERVICE), state="readonly", width=30)
         service_box.grid(row=1, column=1, sticky="w", pady=5)
         service_box.bind("<<ComboboxSelected>>", self.apply_ai_provider_preset)
         for row, (label, variable, secret) in enumerate((
@@ -651,7 +666,10 @@ class App(tk.Tk):
             ("企业微信 Webhook（改写 TXT 完成后发送）", self.webhook, True),
         ), start=2):
             ttk.Label(page, text=label).grid(row=row, column=0, sticky="w", pady=5)
-            ttk.Entry(page, textvariable=variable, width=76, show="*" if secret else "").grid(row=row, column=1, sticky="ew", pady=5)
+            if label == "模型":
+                ttk.Combobox(page, textvariable=variable, values=MODEL_CHOICES, width=74).grid(row=row, column=1, sticky="ew", pady=5)
+            else:
+                ttk.Entry(page, textvariable=variable, width=76, show="*" if secret else "").grid(row=row, column=1, sticky="ew", pady=5)
         page.columnconfigure(1, weight=1)
         buttons = ttk.Frame(page)
         buttons.grid(row=8, column=1, sticky="w", pady=12)
@@ -754,9 +772,11 @@ class App(tk.Tk):
     def apply_ai_provider_preset(self, _event=None) -> None:
         if self.ai_service.get() == OFFICIAL_AI_SERVICE:
             self.rewrite_url.set(DEFAULT_AI_URL)
-            self.model.set("deepseek-v4-flash")
+            self.model.set(OFFICIAL_MODEL)
             self.max_request_chars.set("8000")
             self.request_timeout_seconds.set("300")
+        elif self.ai_service.get() == BAILIAN_AI_SERVICE:
+            self.model.set(BAILIAN_MODEL_CHOICES[0])
 
     def choose_source_dir(self) -> None:
         selected = filedialog.askdirectory(initialdir=str(configured_source_dir(self.source_dir.get())))

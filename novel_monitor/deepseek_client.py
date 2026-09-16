@@ -60,6 +60,14 @@ def is_deepseek_official_url(url: str) -> bool:
     return (urlsplit(url).hostname or "").lower() == "api.deepseek.com"
 
 
+def is_aliyun_bailian_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host.endswith(".maas.aliyuncs.com") or host in {
+        "dashscope.aliyuncs.com",
+        "dashscope-intl.aliyuncs.com",
+    }
+
+
 def validate_optimized_text(source_text: str, optimized_text: str) -> None:
     source = source_text.strip()
     optimized = optimized_text.strip()
@@ -500,6 +508,8 @@ def _optimize_chunk(
         request_body = {"model": model, "messages": request_messages, "temperature": 0.1}
         if is_deepseek_official_url(url):
             request_body["thinking"] = {"type": "disabled"}
+        elif is_aliyun_bailian_url(url):
+            request_body["enable_thinking"] = False
         response = requests.post(
             url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},

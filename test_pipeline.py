@@ -22,7 +22,7 @@ import novel_monitor.history as history_store
 from novel_monitor.history import append_history, prune_history
 from novel_monitor.logging_setup import cleanup_old_logs
 from novel_monitor.runner import is_transient_error
-from unified_app import ALIYUN_VOICES, COMPLETE_DIR, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, configured_output_dir, configured_source_dir, normalize_aliyun_random_voices, normalize_random_voices, rebase_managed_paths, test_interfaces
+from unified_app import ALIYUN_VOICES, BAILIAN_AI_SERVICE, BAILIAN_MODEL_CHOICES, COMPLETE_DIR, OFFICIAL_AI_SERVICE, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, ai_service_for_url, configured_output_dir, configured_source_dir, normalize_aliyun_random_voices, normalize_random_voices, rebase_managed_paths, test_interfaces
 
 
 class PipelineTests(unittest.TestCase):
@@ -81,9 +81,11 @@ class PipelineTests(unittest.TestCase):
                 return None
 
             request_urls = []
+            request_bodies = []
 
             def ai_post(url, *_args, **_kwargs):
                 request_urls.append(url)
+                request_bodies.append(_kwargs["json"])
                 return Response()
 
             (root / "ai_api_url.txt").write_text("https://workspace.cn-beijing.maas.aliyuncs.com/api/v1", encoding="utf-8")
@@ -91,6 +93,13 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(results, {"AI": "正常", "企业微信": "未配置", "Edge": "正常", "阿里云": "未配置"})
             self.assertEqual(request_urls, ["https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"])
+            self.assertFalse(request_bodies[0]["enable_thinking"])
+
+    def test_aliyun_bailian_models_are_selectable_and_manual_urls_stay_custom(self):
+        self.assertEqual(BAILIAN_MODEL_CHOICES, ("deepseek-v4-flash-0731", "qwen3.8-flash"))
+        self.assertEqual(ai_service_for_url("https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"), BAILIAN_AI_SERVICE)
+        self.assertEqual(ai_service_for_url("https://api.deepseek.com/chat/completions"), OFFICIAL_AI_SERVICE)
+        self.assertEqual(ai_service_for_url("https://example.test/chat/completions"), "自定义")
 
     def test_official_deepseek_requests_disable_thinking(self):
         request_bodies = []
@@ -115,6 +124,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(request_bodies[0]["thinking"], {"type": "disabled"})
         self.assertEqual(deepseek_client.MAX_REQUEST_TEXT_CHARS, 8000)
         self.assertEqual(deepseek_client.DEFAULT_REQUEST_TIMEOUT_SECONDS, 300)
+
+    def test_aliyun_bailian_requests_disable_thinking(self):
+        request_bodies = []
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"finish_reason": "stop", "message": {"content": '{"0":"完整正文。"}'}}]}
+
+        def post(_url, **kwargs):
+            request_bodies.append(kwargs["json"])
+            return Response()
+
+        with patch.object(deepseek_client.requests, "post", side_effect=post):
+            result = deepseek_client.optimize_text(
+                "key",
+                "deepseek-v4-flash",
+                "完整正文。",
+                url="https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+            )
+
+        self.assertEqual(result, "完整正文。")
+        self.assertFalse(request_bodies[0]["enable_thinking"])
+        self.assertNotIn("thinking", request_bodies[0])
 
     def test_edge_failure_falls_back_to_aliyun_and_produces_valid_mp3(self):
         with tempfile.TemporaryDirectory() as temporary:
