@@ -33,17 +33,19 @@ Windows 上可运行 `run_tests.bat`；`运行回归测试.bat` 保留为中文�
 
 构建桌面候选使用 `构建桌面版.bat`。正式发布前必须完整阅读 `TIMEOFF.md`，并遵守其中的隔离构建、用户数据保护、升级回滚和公网回读要求。
 
-## GitHub 自动更新发布
+## 国内 OSS 自动更新发布
 
-已安装版本每 10 分钟检查一次 GitHub Releases。更新包只替换安装目录的 `app`，不会打包或覆盖用户的小说、音频、配置、日志和队列数据。
+从 **1.0.19** 起，已安装版本每 10 分钟检查一次阿里云 OSS 国内更新源。更新包只替换安装目录的 `app`，不会打包或覆盖用户的小说、音频、配置、日志和队列数据。
 
-发布新版本时，创建并推送标签 `v1.0.16`。`Build GitHub release` 会先跑离线回归，再构建并发布：
+发布新版本时，创建并推送标签。`Build domestic OSS release package` 会先跑离线回归，再生成待上传到 OSS 的目录：
 
 - `app.zip`：已安装用户自动下载的更新包；
-- `latest.json`：版本、SHA-256 与下载地址清单；
+- `latest.json`：版本、SHA-256 与国内下载地址清单；
 - `novel-processing-center-<版本>-windows-x64.zip`：给新电脑首次安装的完整包；解压后双击 `Start-App.cmd` 启动。
 
-客户端固定读取仓库最新 Release 的 `latest.json`；后续只要发布更高版本标签，已安装客户端就会发现并安装属于本程序的更新。仓库须保持公开，或另行给更新器配置可公开读取的下载地址。
+上传时先上传 `app.zip` 和完整包，最后上传 `latest.json` 与 `latest.js`；后两个文件发布前不可覆盖。客户端下载和更新均固定读取 `https://luotuoqiluotuozhaoma-download.oss-cn-beijing.aliyuncs.com/updates/novel/`，不依赖 GitHub。
+
+1.0.18 及更早版本仍使用 GitHub 更新地址，不能在无法访问 GitHub 的电脑上被远程切换；请先从下载站手动安装一次 1.0.19 或更高的国内完整包，之后即会走国内自动更新。
 
 ## 当前发布状态
 

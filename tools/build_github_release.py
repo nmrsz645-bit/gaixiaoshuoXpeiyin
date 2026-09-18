@@ -17,10 +17,10 @@ import zipfile
 from pathlib import Path
 
 
-REPOSITORY = "nmrsz645-bit/gaixiaoshuoXpeiyin"
 APP_NAME = "小说处理中心.exe"
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 SOURCE_ROOT = Path(__file__).resolve().parent.parent
+OSS_UPDATE_ROOT = "https://luotuoqiluotuozhaoma-download.oss-cn-beijing.aliyuncs.com/updates/novel"
 
 
 def sha256(path: Path) -> str:
@@ -91,8 +91,10 @@ def main() -> None:
             "sha256": sha256(app_zip),
             "files": files,
             "version": args.version,
-            "notes": args.notes or f"GitHub Release v{args.version}",
-            "url": f"https://github.com/{REPOSITORY}/releases/download/v{args.version}/app.zip",
+            "notes": args.notes or f"国内 OSS 更新 v{args.version}",
+            "url": f"{OSS_UPDATE_ROOT}/app.zip",
+            "fullPackageUrl": f"{OSS_UPDATE_ROOT}/novel-processing-center-{args.version}-windows-x64.zip",
+            "fullPackageSha256": sha256(full_zip),
         }
         (output / "latest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         shutil.rmtree(build, ignore_errors=True)

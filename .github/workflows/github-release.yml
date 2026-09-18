@@ -1,12 +1,9 @@
-name: Build GitHub release
+name: Build domestic OSS release package
 
 on:
   push:
     tags:
       - "v*"
-
-permissions:
-  contents: write
 
 jobs:
   release:
@@ -21,14 +18,17 @@ jobs:
           python-version: "3.13"
       - run: python -m pip install -r requirements.txt
       - run: cmd /c run_tests.bat
-      - name: Build release archives
+      - name: Build domestic release archives
         shell: pwsh
         run: |
           $version = '${{ github.ref_name }}'.TrimStart('v')
           python tools/build_github_release.py --version $version --output release
-      - name: Publish GitHub Release
+      - name: Arrange OSS upload files
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create '${{ github.ref_name }}' release/app.zip release/latest.json release/novel-processing-center-*-windows-x64.zip --title '${{ github.ref_name }}' --generate-notes
+          python tools/prepare_domestic_release.py --release release --output oss-upload
+      - name: Keep verified OSS upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: novel-processing-center-oss-${{ github.ref_name }}
+          path: oss-upload/updates/novel
