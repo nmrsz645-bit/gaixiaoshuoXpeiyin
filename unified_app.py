@@ -86,7 +86,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.20"
+DEFAULT_APP_VERSION = "1.0.21"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -117,7 +117,7 @@ def read_app_version(version_paths=None) -> str:
 
 
 def app_window_title(version: str | None = None) -> str:
-    return f"小说处理中心 v{(version or read_app_version()).removeprefix('v')}"
+    return f"小说处理中心（改小说+配音） v{(version or read_app_version()).removeprefix('v')}"
 
 
 def acquire_single_instance() -> bool:
