@@ -85,6 +85,8 @@ GUARD_STOP_PATH = BASE_DIR / "停止守护.flag"
 _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
+APP_VERSION_FILE_NAME = "version.json"
+DEFAULT_APP_VERSION = "1.0.20"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -99,6 +101,23 @@ def ai_service_for_url(url: str) -> str:
     if is_aliyun_bailian_url(url):
         return BAILIAN_AI_SERVICE
     return CUSTOM_AI_SERVICE
+
+
+def read_app_version(version_paths=None) -> str:
+    """Read the installed application version, with a safe source fallback."""
+    paths = version_paths or (BASE_DIR / APP_VERSION_FILE_NAME, RESOURCE_DIR / APP_VERSION_FILE_NAME)
+    for path in dict.fromkeys(paths):
+        try:
+            version = json.loads(Path(path).read_text(encoding="utf-8")).get("version")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(version, str) and version.strip():
+            return version.strip().removeprefix("v")
+    return DEFAULT_APP_VERSION
+
+
+def app_window_title(version: str | None = None) -> str:
+    return f"小说处理中心 v{(version or read_app_version()).removeprefix('v')}"
 
 
 def acquire_single_instance() -> bool:
@@ -584,7 +603,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         ensure_app_files()
-        self.title("小说处理中心")
+        self.title(app_window_title())
         self.geometry("900x700")
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.service = UnifiedService(self.log)

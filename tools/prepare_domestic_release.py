@@ -37,20 +37,22 @@ def main() -> None:
     release = args.release.resolve()
     output = args.output.resolve()
     manifest_path = release / "latest.json"
-    app_zip = release / "app.zip"
     if output.exists():
         raise SystemExit(f"output directory already exists: {output}")
-    if not manifest_path.is_file() or not app_zip.is_file():
-        raise SystemExit("release must contain latest.json and app.zip")
+    if not manifest_path.is_file():
+        raise SystemExit("release must contain latest.json")
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     version = str(manifest.get("version", ""))
     if not VERSION_PATTERN.fullmatch(version):
         raise SystemExit("manifest version is invalid")
+    app_zip = release / f"novel-processing-center-{version}-update.zip"
+    if not app_zip.is_file():
+        raise SystemExit(f"update package is missing: {app_zip.name}")
     full_zip = release / f"novel-processing-center-{version}-windows-x64.zip"
     if not full_zip.is_file():
         raise SystemExit(f"full package is missing: {full_zip.name}")
-    if manifest.get("url") != f"{OSS_UPDATE_ROOT}/app.zip":
+    if manifest.get("url") != f"{OSS_UPDATE_ROOT}/releases/{version}/{app_zip.name}":
         raise SystemExit("manifest update URL is not the domestic OSS path")
     if manifest.get("sha256") != sha256(app_zip):
         raise SystemExit("app.zip hash does not match manifest")
@@ -61,9 +63,12 @@ def main() -> None:
             raise SystemExit("app.zip does not contain version.json")
 
     destination = output / "updates" / "novel"
-    destination.mkdir(parents=True)
-    shutil.copy2(app_zip, destination / "app.zip")
-    shutil.copy2(full_zip, destination / full_zip.name)
+    release_destination = destination / "releases" / version
+    release_destination.mkdir(parents=True)
+    shutil.copy2(app_zip, release_destination / app_zip.name)
+    shutil.copy2(full_zip, release_destination / full_zip.name)
+    manifest["fullPackageUrl"] = f"{OSS_UPDATE_ROOT}/releases/{version}/{full_zip.name}"
+    manifest["fullPackageSha256"] = sha256(full_zip)
     (destination / "latest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     page_manifest = {
         "version": version,
@@ -77,7 +82,7 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"prepared: {destination}")
-    print("Upload app.zip and the full ZIP first; upload latest.json and latest.js last.")
+    print("Upload the immutable releases/<version> files first; upload latest.json and latest.js last.")
 
 
 if __name__ == "__main__":

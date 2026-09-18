@@ -22,7 +22,7 @@ import novel_monitor.history as history_store
 from novel_monitor.history import append_history, prune_history
 from novel_monitor.logging_setup import cleanup_old_logs
 from novel_monitor.runner import is_transient_error
-from unified_app import ALIYUN_VOICES, BAILIAN_AI_SERVICE, BAILIAN_MODEL_CHOICES, COMPLETE_DIR, OFFICIAL_AI_SERVICE, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, ai_service_for_url, configured_output_dir, configured_source_dir, normalize_aliyun_random_voices, normalize_random_voices, rebase_managed_paths, test_interfaces
+from unified_app import ALIYUN_VOICES, BAILIAN_AI_SERVICE, BAILIAN_MODEL_CHOICES, COMPLETE_DIR, DEFAULT_APP_VERSION, OFFICIAL_AI_SERVICE, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, ai_service_for_url, app_window_title, configured_output_dir, configured_source_dir, normalize_aliyun_random_voices, normalize_random_voices, read_app_version, rebase_managed_paths, test_interfaces
 
 
 class PipelineTests(unittest.TestCase):
@@ -48,6 +48,14 @@ class PipelineTests(unittest.TestCase):
     def test_configured_output_directory_uses_value_or_default(self):
         self.assertEqual(configured_output_dir("D:/我的配音"), Path("D:/我的配音"))
         self.assertEqual(configured_output_dir("  "), COMPLETE_DIR)
+
+    def test_window_title_uses_runtime_version_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            version_file = Path(temporary) / "version.json"
+            version_file.write_text('{"version": "1.0.20"}', encoding="utf-8")
+            self.assertEqual(read_app_version((version_file,)), "1.0.20")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.20")
+        self.assertEqual(app_window_title("v1.0.20"), "小说处理中心 v1.0.20")
 
     def test_aliyun_random_voice_selection_uses_only_known_voices(self):
         selected = normalize_aliyun_random_voices([ALIYUN_VOICES[2], "not-a-voice", ALIYUN_VOICES[0]])

@@ -39,11 +39,11 @@ Windows 上可运行 `run_tests.bat`；`运行回归测试.bat` 保留为中文�
 
 发布新版本时，创建并推送标签。`Build domestic OSS release package` 会先跑离线回归，再生成待上传到 OSS 的目录：
 
-- `app.zip`：已安装用户自动下载的更新包；
+- `releases/<版本>/novel-processing-center-<版本>-update.zip`：已安装用户自动下载的不可变更新包；
 - `latest.json`：版本、SHA-256 与国内下载地址清单；
 - `novel-processing-center-<版本>-windows-x64.zip`：给新电脑首次安装的完整包；解压后双击 `Start-App.cmd` 启动。
 
-上传时先上传 `app.zip` 和完整包，最后上传 `latest.json` 与 `latest.js`；后两个文件发布前不可覆盖。客户端下载和更新均固定读取 `https://luotuoqiluotuozhaoma-download.oss-cn-beijing.aliyuncs.com/updates/novel/`，不依赖 GitHub。
+上传时先上传 `releases/<版本>/` 内的更新包和完整包，最后上传 `latest.json` 与 `latest.js`；后两个文件发布前不可覆盖。客户端下载和更新均固定读取 `https://luotuoqiluotuozhaoma-download.oss-cn-beijing.aliyuncs.com/updates/novel/`，不依赖 GitHub。
 
 1.0.18 及更早版本仍使用 GitHub 更新地址，不能在无法访问 GitHub 的电脑上被远程切换；请先从下载站手动安装一次 1.0.19 或更高的国内完整包，之后即会走国内自动更新。
 
