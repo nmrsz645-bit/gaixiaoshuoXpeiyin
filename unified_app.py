@@ -10,6 +10,7 @@ import threading
 import time
 import asyncio
 import tempfile
+from contextlib import nullcontext
 import tkinter as tk
 import winreg
 from ctypes import wintypes
@@ -29,6 +30,7 @@ from novel_monitor.deepseek_client import (
     RULES_FILE_NAME,
     is_aliyun_bailian_url,
     is_deepseek_official_url,
+    parse_banned_rules,
 )
 from novel_monitor.logging_setup import setup_logging
 from novel_monitor.file_utils import move_to_directory
@@ -86,7 +88,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.22"
+DEFAULT_APP_VERSION = "1.0.23"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -403,6 +405,23 @@ def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.pos
 def write_if_missing(path: Path, value: str) -> None:
     if not path.exists():
         path.write_text(value, encoding="utf-8")
+
+
+def save_edited_text(path: Path, content: str) -> None:
+    if path.name == BANNED_TERMS_FILE_NAME:
+        parse_banned_rules(content)
+    from novel_monitor.banned_rules_guard import banned_rules_guard
+    guard = banned_rules_guard(path.parent) if path.name == BANNED_TERMS_FILE_NAME else nullcontext()
+    with guard:
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def ensure_app_files() -> None:
@@ -906,7 +925,11 @@ class App(tk.Tk):
         editor.insert("1.0", self.read_text(path))
 
         def save() -> None:
-            path.write_text(editor.get("1.0", "end-1c"), encoding="utf-8")
+            try:
+                save_edited_text(path, editor.get("1.0", "end-1c"))
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("保存失败", str(exc), parent=dialog)
+                return
             self.log(f"{title}已保存。")
             dialog.destroy()
 

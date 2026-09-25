@@ -18,6 +18,8 @@ import runtime
 import aliyun_tts
 from novel_monitor.logging_setup import retained_file_handler
 from novel_monitor.file_utils import move_to_directory
+from novel_monitor.banned_rules_guard import banned_rules_guard
+from novel_monitor.deepseek_client import BannedRuleConfigError, find_banned_terms, load_banned_rules
 
 BASE_DIR = runtime.BASE_DIR
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -29,6 +31,30 @@ PID_PATH = BASE_DIR / "voice_monitor.pid"
 START_TIME_PATH = BASE_DIR / "monitor_start_time.txt"
 CURRENT_TASK_PATH = BASE_DIR / "current_task.txt"
 RETRY_STATE = {}
+
+
+class VoiceBannedTermError(ValueError):
+    """A queued TXT cannot be voiced under the current banned-term rules."""
+
+
+def ensure_voice_text_allowed(text, config):
+    rules_dir = Path(config.get("banned_rules_dir") or BASE_DIR / "改写")
+    banned_terms, _replacements = load_banned_rules(rules_dir)
+    remaining = find_banned_terms(text, banned_terms)
+    if remaining:
+        raise VoiceBannedTermError(f"待配音文本仍含指定违禁词，未生成音频：{'、'.join(remaining)}")
+
+
+def voice_rules_dir(config):
+    return Path(config.get("banned_rules_dir") or BASE_DIR / "改写")
+
+
+def audio_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 MIN_MP3_BYTES = 1024
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000 if os.name == "nt" else 0)
 MAX_COMPLETED_AUDIO_SECONDS = 59 * 60
@@ -779,6 +805,7 @@ def process_file(text_path, config, synthesize=synthesize, on_success=None):
     text = read_text(text_path)
     if not text:
         raise ValueError(f"待配音文本为空：{text_path.name}")
+    ensure_voice_text_allowed(text, config)
 
     receipt_path = _receipt_path(text_path, text, config)
     receipt = _load_receipt(receipt_path)
@@ -805,7 +832,7 @@ def process_file(text_path, config, synthesize=synthesize, on_success=None):
             if not _valid_mp3(output_path):
                 output_path.unlink(missing_ok=True)
                 raise RuntimeError("配音接口未生成有效 MP3，已保留源 TXT。")
-            receipt.update({"audio_ready": True, "engine": actual_engine})
+            receipt.update({"audio_ready": True, "engine": actual_engine, "audio_sha256": audio_sha256(output_path)})
             _save_receipt(receipt_path, receipt)
         final_duration, was_trimmed = limit_completed_mp3_duration(output_path)
         receipt.update({
@@ -813,15 +840,23 @@ def process_file(text_path, config, synthesize=synthesize, on_success=None):
             "engine": actual_engine,
             "duration_seconds": round(final_duration, 3),
             "trimmed_to_seconds": TRIMMED_AUDIO_SECONDS if was_trimmed else None,
+            "audio_sha256": audio_sha256(output_path),
         })
         _save_receipt(receipt_path, receipt)
     finally:
         clear_current_task()
 
-    if config.get("keep_text_after_voice", True) and config.get("source_after_success", "move_to_output") == "move_to_output":
-        shutil.move(str(text_path), str(completed_text_path))
-    elif not config.get("keep_text_after_voice", True) or config.get("delete_source", True):
-        text_path.unlink()
+    with banned_rules_guard(voice_rules_dir(config)):
+        ensure_voice_text_allowed(text, config)
+        if config.get("keep_text_after_voice", True) and config.get("source_after_success", "move_to_output") == "move_to_output":
+            shutil.move(str(text_path), str(completed_text_path))
+            try:
+                ensure_voice_text_allowed(text, config)
+            except (VoiceBannedTermError, BannedRuleConfigError):
+                shutil.move(str(completed_text_path), str(text_path))
+                raise
+        elif not config.get("keep_text_after_voice", True) or config.get("delete_source", True):
+            text_path.unlink()
     receipt_path.unlink(missing_ok=True)
     logging.info("已生成: [%s] %s", "Edge" if actual_engine == "edge" else "阿里云", output_path)
     if on_success:
@@ -830,6 +865,29 @@ def process_file(text_path, config, synthesize=synthesize, on_success=None):
         except Exception:
             logging.exception("配音成功统计回调失败，不影响已完成文件")
     return output_path
+
+
+def quarantine_banned_voice_audio(text_path, config):
+    """Move only the audio tied to this claimed TXT and current output directory."""
+    text = read_text(text_path)
+    receipt_path = _receipt_path(text_path, text, config)
+    receipt = _load_receipt(receipt_path)
+    if not receipt or not receipt.get("audio_ready"):
+        return None
+    output_dir = Path(config["output_dir"]).resolve()
+    audio = Path(receipt["output_path"])
+    completed_text = Path(receipt["completed_text_path"])
+    if (audio.parent.resolve() != output_dir or completed_text.parent.resolve() != output_dir
+            or audio.stem != completed_text.stem or completed_text.exists()):
+        raise RuntimeError("配音回执的音频路径无法安全确认，已保留 TXT 和 MP3 等待人工检查")
+    expected_hash = receipt.get("audio_sha256")
+    if audio.exists() and (not expected_hash or audio_sha256(audio) != expected_hash):
+        raise RuntimeError("配音回执缺少音频指纹或音频已变化，已保留 TXT 和 MP3 等待人工检查")
+    moved = move_to_directory(audio, voice_failed_dir(config)) if audio.exists() else None
+    receipt_path.unlink(missing_ok=True)
+    if moved:
+        logging.warning("违禁词文本对应的已有 MP3 已保留在配音失败：%s", moved)
+    return moved
 
 
 def find_text_files(config):
@@ -843,6 +901,8 @@ def retry_delay_seconds(failures):
 
 
 def is_transient_voice_error(error):
+    if isinstance(error, (VoiceBannedTermError, BannedRuleConfigError)):
+        return False
     transient_type_names = {"TimeoutError", "ConnectionError", "gaierror"}
     if any(base.__name__ in transient_type_names for base in type(error).__mro__):
         return True
@@ -890,7 +950,8 @@ def process_once(
                 continue
             if stop_checker():
                 break
-            claimed = claim_text_file(text_path, config)
+            with banned_rules_guard(voice_rules_dir(config)):
+                claimed = claim_text_file(text_path, config)
             if stop_checker():
                 release_claim(claimed, config)
                 break
@@ -903,10 +964,26 @@ def process_once(
             if claimed is None:
                 logging.exception("配音文件领取失败，将在下一轮重试: %s", text_path)
                 continue
+            if isinstance(exc, BannedRuleConfigError):
+                if Path(claimed).exists():
+                    released = release_claim(claimed, config)
+                    key = str(released)
+                RETRY_STATE[key] = (memory_failures, clock() + 60)
+                logging.error("指定违禁词配置有误，暂停配音，未消耗重试次数：%s", exc)
+                continue
             retry_failures = memory_failures + 1
             transient = is_transient_voice_error(exc)
+            if isinstance(exc, VoiceBannedTermError):
+                try:
+                    quarantine_banned_voice_audio(Path(claimed), config)
+                except Exception:
+                    logging.exception("已有音频未能安全归档，保留 TXT 等待下次处理：%s", claimed)
+                    released = release_claim(claimed, config)
+                    RETRY_STATE[str(released)] = (memory_failures, clock() + 60)
+                    continue
+                terminal_failures = int(config.get("max_terminal_failures", 3))
             if not transient:
-                terminal_failures += 1
+                terminal_failures += 0 if isinstance(exc, VoiceBannedTermError) else 1
             record_failed_item(Path(key), failed_items_path, attempts=terminal_failures, terminal=False)
             if claimed and Path(claimed).exists():
                 if not transient and terminal_failures >= int(config.get("max_terminal_failures", 3)):

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import AppConfig
+from .deepseek_client import BannedRuleConfigError, load_banned_rules
 from .file_utils import is_txt_file, move_to_failed, wait_until_stable
 from .history import append_history
 from .processor import BannedTermError, claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
@@ -159,6 +160,7 @@ class MonitorService:
             return
         active_path: Path | None = None
         try:
+            load_banned_rules(self.config.root)
             if not is_claimed_source(path, self.config):
                 if not wait_until_stable(path, self.config.stable_seconds):
                     self._emit_log(f"文件消失或无法稳定: {path}")
@@ -212,6 +214,12 @@ class MonitorService:
                 self.retry_queue.pop(path, None)
             self._emit_log(f"完成: {path.name}")
         except Exception as exc:
+            if isinstance(exc, BannedRuleConfigError):
+                with self._state_lock:
+                    existing = self.retry_queue.get(path)
+                    self.retry_queue[path] = RetryItem(path, existing.attempts if existing else 0, time.time() + 60)
+                self._emit_log(f"指定违禁词配置有误，暂停本书，未消耗重试次数：{exc}")
+                return
             with self._state_lock:
                 self.stats.mark_failed()
             transient = is_transient_error(exc)

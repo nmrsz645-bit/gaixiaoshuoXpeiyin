@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import AppConfig
+from .deepseek_client import BannedRuleConfigError, load_banned_rules
 from .file_utils import is_txt_file, move_to_failed, wait_until_stable
 from .processor import BannedTermError, claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
 from .status import MonitorStats
@@ -58,6 +59,7 @@ def _attempt(
         queue.pop(path, None)
         return
     try:
+        load_banned_rules(config.root)
         if not is_claimed_source(path, config):
             if not wait_until_stable(path, config.stable_seconds):
                 logger.warning("文件消失或无法稳定: %s", path)
@@ -73,6 +75,11 @@ def _attempt(
         _log_status(config, logger, stats)
         queue.pop(path, None)
     except Exception as exc:
+        if isinstance(exc, BannedRuleConfigError):
+            existing = queue.get(path)
+            queue[path] = RetryItem(path, existing.attempts if existing else 0, time.time() + 60)
+            logger.error("指定违禁词配置有误，暂停本书，未消耗重试次数：%s", exc)
+            return
         stats.mark_failed()
         transient = is_transient_error(exc)
         persisted = load_retry_state(path, config)

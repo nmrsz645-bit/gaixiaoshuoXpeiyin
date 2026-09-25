@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from datetime import date, datetime, timedelta
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -55,9 +56,9 @@ class PipelineTests(unittest.TestCase):
             version_file = Path(temporary) / "version.json"
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.22")
-        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.22")
-        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.22")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.23")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.23")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.23")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
     def test_aliyun_random_voice_selection_uses_only_known_voices(self):
@@ -277,6 +278,226 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((complete / "小说.txt").exists())
             self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
 
+    def test_existing_voice_queue_with_banned_term_moves_to_voice_failed_without_audio(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "已改完成"
+            complete = root / "完成"
+            voice_failed = root / "配音失败"
+            rules_dir = root / "改写"
+            for folder in (queue, complete, voice_failed, rules_dir):
+                folder.mkdir()
+            (rules_dir / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
+            source = queue / "旧小说.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({
+                "input_dir": str(queue), "output_dir": str(complete),
+                "voice_failed_dir": str(voice_failed), "failed_items_path": str(root / "failed.json"),
+                "banned_rules_dir": str(rules_dir), "max_terminal_failures": 3,
+            })
+            calls = []
+
+            async def synthesize(_text, _output, _config):
+                calls.append(True)
+                return "edge"
+
+            processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
+            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+
+            self.assertEqual(calls, [])
+            self.assertFalse(source.exists())
+            self.assertEqual((voice_failed / "旧小说.txt").read_text(encoding="utf-8"), "众人抓奸后离开。")
+            self.assertEqual(list(complete.iterdir()), [])
+
+    def test_rules_changed_during_voice_synthesis_quarantine_audio_and_txt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete, failed, rules = (root / name for name in ("queue", "complete", "voice-failed", "改写"))
+            for directory in (queue, complete, failed, rules):
+                directory.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete), "voice_failed_dir": str(failed),
+                           "banned_rules_dir": str(rules), "failed_items_path": str(root / "failed.json")})
+            voice_monitor.RETRY_STATE.clear()
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
+                return "edge"
+
+            processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+            self.assertEqual((failed / "novel.txt").read_text(encoding="utf-8"), "众人抓奸后离开。")
+            self.assertEqual((failed / "novel.mp3").read_bytes(), self.valid_mp3_bytes())
+            self.assertEqual(list(complete.iterdir()), [])
+
+    def test_rules_changed_during_final_voice_move_do_not_leave_completed_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete, failed, rules = (root / name for name in ("queue", "complete", "voice-failed", "改写"))
+            for directory in (queue, complete, failed, rules):
+                directory.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete), "voice_failed_dir": str(failed),
+                           "banned_rules_dir": str(rules), "failed_items_path": str(root / "failed.json")})
+            voice_monitor.RETRY_STATE.clear()
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            real_move = voice_monitor.shutil.move
+            moved_once = []
+
+            def move_then_edit(src, dst):
+                result = real_move(src, dst)
+                if Path(dst).parent == complete and not moved_once:
+                    moved_once.append(True)
+                    (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
+                return result
+
+            processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)), patch.object(voice_monitor.shutil, "move", side_effect=move_then_edit):
+                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+            self.assertEqual((failed / "novel.txt").read_text(encoding="utf-8"), "众人抓奸后离开。")
+            self.assertEqual((failed / "novel.mp3").read_bytes(), self.valid_mp3_bytes())
+            self.assertEqual(list(complete.iterdir()), [])
+
+    def test_invalid_rules_during_final_voice_move_restore_txt_to_queue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete, failed, rules = (root / name for name in ("queue", "complete", "voice-failed", "改写"))
+            for directory in (queue, complete, failed, rules):
+                directory.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete), "voice_failed_dir": str(failed),
+                           "banned_rules_dir": str(rules), "failed_items_path": str(root / "failed.json")})
+            voice_monitor.RETRY_STATE.clear()
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            real_move = voice_monitor.shutil.move
+            moved_once = []
+
+            def move_then_corrupt(src, dst):
+                result = real_move(src, dst)
+                if Path(dst).parent == complete and not moved_once:
+                    moved_once.append(True)
+                    (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_bytes(b"\xff\xfe")
+                return result
+
+            processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)), patch.object(voice_monitor.shutil, "move", side_effect=move_then_corrupt):
+                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+            self.assertEqual(source.read_text(encoding="utf-8"), "众人抓奸后离开。")
+            self.assertEqual(list(complete.glob("*.txt")), [])
+            self.assertTrue((complete / "novel.mp3").exists())
+            self.assertEqual(list(failed.iterdir()), [])
+
+    def test_preexisting_audio_receipt_is_quarantined_with_newly_banned_txt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete, failed, rules = (root / name for name in ("queue", "complete", "voice-failed", "改写"))
+            for directory in (queue, complete, failed, rules):
+                directory.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
+            audio_path = complete / "novel.mp3"
+            audio_path.write_bytes(self.valid_mp3_bytes())
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete), "voice_failed_dir": str(failed),
+                           "banned_rules_dir": str(rules), "failed_items_path": str(root / "failed.json")})
+            receipt = voice_monitor._receipt_path(source, source.read_text(encoding="utf-8"), config)
+            voice_monitor._save_receipt(receipt, {"output_path": str(audio_path),
+                "completed_text_path": str(complete / "novel.txt"), "audio_ready": True,
+                "audio_sha256": voice_monitor.audio_sha256(audio_path)})
+            voice_monitor.RETRY_STATE.clear()
+
+            self.assertEqual(voice_monitor.process_once(config, stable_checker=lambda *_: True), 0)
+            self.assertEqual((failed / "novel.txt").read_text(encoding="utf-8"), "众人抓奸后离开。")
+            self.assertEqual((failed / "novel.mp3").read_bytes(), self.valid_mp3_bytes())
+            self.assertEqual(list(complete.iterdir()), [])
+
+    def test_stale_voice_receipt_cannot_move_unrelated_audio(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete, failed, rules = (root / name for name in ("queue", "complete", "voice-failed", "改写"))
+            for directory in (queue, complete, failed, rules):
+                directory.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
+            unrelated = complete / "novel.mp3"
+            unrelated.write_bytes(b"unrelated user audio")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete), "voice_failed_dir": str(failed),
+                           "banned_rules_dir": str(rules), "failed_items_path": str(root / "failed.json")})
+            receipt = voice_monitor._receipt_path(source, source.read_text(encoding="utf-8"), config)
+            voice_monitor._save_receipt(receipt, {"output_path": str(unrelated),
+                "completed_text_path": str(complete / "novel.txt"), "audio_ready": True,
+                "audio_sha256": "0" * 64})
+            voice_monitor.RETRY_STATE.clear()
+
+            self.assertEqual(voice_monitor.process_once(config, stable_checker=lambda *_: True), 0)
+            self.assertEqual(unrelated.read_bytes(), b"unrelated user audio")
+            self.assertEqual(source.read_text(encoding="utf-8"), "众人抓奸后离开。")
+            self.assertEqual(list(failed.iterdir()), [])
+
+    def test_invalid_banned_rules_do_not_fail_existing_voice_queue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "已改完成"
+            rules_dir = root / "改写"
+            queue.mkdir()
+            rules_dir.mkdir()
+            (rules_dir / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=出轨\n出轨\n", encoding="utf-8")
+            source = queue / "旧小说.txt"
+            source.write_text("原始文本", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({
+                "input_dir": str(queue), "output_dir": str(root / "完成"),
+                "voice_failed_dir": str(root / "配音失败"),
+                "failed_items_path": str(root / "failed.json"), "banned_rules_dir": str(rules_dir),
+            })
+
+            self.assertEqual(voice_monitor.process_once(config, stable_checker=lambda *_: True), 0)
+
+            self.assertEqual(source.read_text(encoding="utf-8"), "原始文本")
+            self.assertEqual(voice_monitor.failed_attempts(source, config["failed_items_path"]), 0)
+            self.assertEqual(list((root / "配音失败").iterdir()), [])
+
+    def test_invalid_encoding_banned_rules_pause_voice_queue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "已改完成"
+            rules_dir = root / "改写"
+            queue.mkdir()
+            rules_dir.mkdir()
+            (rules_dir / deepseek_client.BANNED_TERMS_FILE_NAME).write_bytes(b"\xff\xfe\x00")
+            source = queue / "旧小说.txt"
+            source.write_text("原始文本", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(root / "完成"),
+                           "voice_failed_dir": str(root / "配音失败"),
+                           "failed_items_path": str(root / "failed.json"), "banned_rules_dir": str(rules_dir)})
+            voice_monitor.RETRY_STATE.clear()
+
+            self.assertEqual(voice_monitor.process_once(config, stable_checker=lambda *_: True), 0)
+            self.assertEqual(source.read_text(encoding="utf-8"), "原始文本")
+            self.assertEqual(voice_monitor.failed_attempts(source, config["failed_items_path"]), 0)
+            self.assertEqual(list((root / "配音失败").glob("*.txt")), [])
+
     def test_rewritten_text_is_deleted_when_voice_text_is_not_kept(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -320,6 +541,7 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(voice_monitor.is_transient_voice_error(TimeoutError()))
         self.assertTrue(voice_monitor.is_transient_voice_error(ConnectionError()))
         self.assertFalse(voice_monitor.is_transient_voice_error(OSError(5, "access denied")))
+        self.assertFalse(voice_monitor.is_transient_voice_error(voice_monitor.VoiceBannedTermError("违禁词含 429")))
 
     def test_long_rewrite_is_sent_in_ordered_chunks_and_rejoined(self):
         text = ("第一段内容。\n" * 1500)
@@ -721,6 +943,50 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "重复配置了不同替换词"):
                 deepseek_client.load_banned_rules(root)
 
+    def test_invalid_banned_rules_leave_rewrite_queue_and_retry_budget_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text(
+                "抓奸=出轨\n出轨\n", encoding="utf-8"
+            )
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始小说", encoding="utf-8")
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-invalid-rules"), lambda *_: None, lambda *_: None
+            )
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True):
+                service.process_once(source)
+
+            self.assertEqual(source.read_text(encoding="utf-8"), "原始小说")
+            self.assertEqual(list(config.failed_dir.iterdir()), [])
+            self.assertEqual(service.retry_queue[source].attempts, 0)
+
+    def test_cli_invalid_banned_rules_leave_source_and_retry_budget_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=出轨\n出轨\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始小说", encoding="utf-8")
+            queue = {}
+            with patch.object(rewrite_runner, "wait_until_stable", return_value=True):
+                rewrite_runner._attempt(source, config, logging.getLogger("test-invalid-cli"), queue, rewrite_runner.MonitorStats(started_at=datetime.now()))
+
+            self.assertEqual(source.read_text(encoding="utf-8"), "原始小说")
+            self.assertEqual(list(config.failed_dir.iterdir()), [])
+            self.assertEqual(queue[source].attempts, 0)
+
+    def test_invalid_banned_rules_cannot_overwrite_saved_gui_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / deepseek_client.BANNED_TERMS_FILE_NAME
+            path.write_text("抓奸=揭露\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "替换词仍包含违禁词"):
+                unified_app.save_edited_text(path, "抓奸=出轨\n出轨\n")
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "抓奸=揭露\n")
+
     def test_mapped_banned_terms_publish_without_second_ai_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -736,6 +1002,116 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(optimize.call_count, 1)
             self.assertEqual(result.read_text(encoding="utf-8"), "第一章 起点\n婚前变心，又去揭露。")
             self.assertFalse(source.exists())
+
+    def test_longer_fixed_replacement_does_not_fail_ai_length_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("甲=乙乙\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("甲" * 100, encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_processor, "send_file"):
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test"))
+
+            self.assertEqual(result.read_text(encoding="utf-8"), "乙乙" * 100)
+
+    def test_changed_banned_rules_during_ai_do_not_send_stale_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            rules_path = root / deepseek_client.BANNED_TERMS_FILE_NAME
+            rules_path.write_text("抓奸=揭露\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+
+            def optimize(**kwargs):
+                rules_path.write_text("揭露=公开\n", encoding="utf-8")
+                return kwargs["text"]
+
+            with patch.object(rewrite_processor, "optimize_text", side_effect=optimize), patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(deepseek_client.BannedRuleConfigError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+
+            send.assert_not_called()
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+            self.assertEqual(len(rewrite_processor.recover_claimed_sources(config)), 1)
+
+    def test_changed_banned_rules_during_webhook_do_not_publish_or_skip_new_send(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            rules_path = root / deepseek_client.BANNED_TERMS_FILE_NAME
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            sends = []
+
+            def send(_url, path):
+                sends.append(Path(path).read_text(encoding="utf-8"))
+                if len(sends) == 1:
+                    rules_path.write_text("抓奸=揭露\n", encoding="utf-8")
+
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_processor, "send_file", side_effect=send):
+                with self.assertRaises(deepseek_client.BannedRulesChangedError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+                self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+                claimed = rewrite_processor.recover_claimed_sources(config)[0]
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test"))
+
+            self.assertEqual(sends, ["众人抓奸后离开。", "众人揭露后离开。"])
+            self.assertEqual(result.read_text(encoding="utf-8"), "众人揭露后离开。")
+
+    def test_rules_changed_during_rewrite_publish_rollback_queue_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            real_publish = rewrite_processor._publish_staged
+
+            def publish_then_edit(*args):
+                result = real_publish(*args)
+                (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
+                return result
+
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_processor, "send_file"), patch.object(rewrite_processor, "_publish_staged", side_effect=publish_then_edit):
+                with self.assertRaises(deepseek_client.BannedRulesChangedError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+            self.assertEqual(len(rewrite_processor.recover_claimed_sources(config)), 1)
+
+    def test_invalid_rules_during_rewrite_publish_rollback_queue_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            real_publish = rewrite_processor._publish_staged
+
+            def publish_then_corrupt(*args):
+                result = real_publish(*args)
+                (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_bytes(b"\xff\xfe")
+                return result
+
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_processor, "send_file"), patch.object(rewrite_processor, "_publish_staged", side_effect=publish_then_corrupt):
+                with self.assertRaises(deepseek_client.BannedRuleConfigError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+            self.assertEqual(len(rewrite_processor.recover_claimed_sources(config)), 1)
+
+    def test_invalid_encoding_banned_rules_pauses_without_consuming_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            config = replace(config, max_retries=1)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_bytes(b"\xff\xfe\x00")
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始小说", encoding="utf-8")
+            service = rewrite_monitor.MonitorService(config, logging.getLogger("test-invalid-encoding"), lambda *_: None, lambda *_: None)
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True):
+                service.process_once(source)
+            self.assertEqual(source.read_text(encoding="utf-8"), "原始小说")
+            self.assertEqual(list(config.failed_dir.glob("*.txt")), [])
+            self.assertEqual(service.retry_queue[source].attempts, 0)
 
     def test_unmapped_banned_term_is_terminal_without_sending(self):
         with tempfile.TemporaryDirectory() as temporary:

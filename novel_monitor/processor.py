@@ -10,7 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import AppConfig
-from .deepseek_client import find_banned_terms, load_ad_compliance_rules, load_banned_rules, load_banned_terms, optimize_text, replace_banned_terms, request_signature, validate_optimized_text
+from .banned_rules_guard import banned_rules_guard
+from .deepseek_client import BannedRuleConfigError, BannedRulesChangedError, find_banned_terms, load_ad_compliance_rules, load_banned_rules, load_banned_terms, optimize_text, replace_banned_terms, request_signature, validate_optimized_text
 from .wecom_client import send_file
 
 
@@ -228,6 +229,13 @@ def process_file(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> Path:
     source = Path(source)
+    extra_rules = load_ad_compliance_rules(config.root)
+    banned_terms, replacements = load_banned_rules(config.root)
+
+    def ensure_rules_unchanged() -> None:
+        if load_banned_rules(config.root) != (banned_terms, replacements):
+            raise BannedRulesChangedError("指定违禁词在处理期间改变，已暂停发送，将按新规则重新处理")
+
     if not is_claimed_source(source, config):
         try:
             belongs_to_input = source.parent.resolve() == config.input_dir.resolve()
@@ -237,8 +245,6 @@ def process_file(
             source = claim_source(source, config)
     logger.info("开始处理: %s", source)
     text = read_source_text(source)
-    extra_rules = load_ad_compliance_rules(config.root)
-    banned_terms, replacements = load_banned_rules(config.root)
     if is_claimed_source(source, config):
         job_id = source.parent.name
         job_dir = source.parent
@@ -262,7 +268,7 @@ def process_file(
         optimized = staged.read_text(encoding="utf-8-sig")
         remaining_terms = find_banned_terms(optimized, banned_terms)
         if not remaining_terms:
-            validate_optimized_text(text, optimized)
+            validate_optimized_text(text, optimized, check_length=not replacements)
     else:
         optimized = optimize_text(
             api_key=config.deepseek_api_key,
@@ -277,10 +283,12 @@ def process_file(
             timeout=config.request_timeout_seconds,
         )
 
+        ensure_rules_unchanged()
+        validate_optimized_text(text, optimized)
         optimized = replace_banned_terms(optimized, replacements)
         remaining_terms = find_banned_terms(optimized, banned_terms)
         if not remaining_terms:
-            validate_optimized_text(text, optimized)
+            validate_optimized_text(text, optimized, check_length=not replacements)
             _atomic_write_text(staged, optimized)
             _atomic_write_json(
                 staged_metadata,
@@ -293,12 +301,33 @@ def process_file(
     if remaining_terms:
         raise BannedTermError(f"指定违禁词没有可用替换词或替换后仍存在，未输出未发送：{'、'.join(remaining_terms)}")
 
-    if not webhook_sent.exists():
+    ensure_rules_unchanged()
+    delivery_signature = hashlib.sha256((generation_signature + "\0" + hashlib.sha256(staged.read_bytes()).hexdigest()).encode("ascii")).hexdigest()
+    sent_signature = webhook_sent.read_text(encoding="utf-8") if webhook_sent.exists() else ""
+    legacy_sent_for_current_stage = (
+        sent_signature == "sent" and staged.exists()
+        and webhook_sent.stat().st_mtime_ns >= staged.stat().st_mtime_ns
+    )
+    if sent_signature != delivery_signature and not legacy_sent_for_current_stage:
         send_file(config.wechat_webhook_url, staged)
-        _atomic_write_text(webhook_sent, "sent")
+        ensure_rules_unchanged()
+        _atomic_write_text(webhook_sent, delivery_signature)
         logger.info("已发送企业微信文件: %s", staged.name)
 
-    output_path = _publish_staged(staged, job_dir, config.output_dir, source.name, job_id)
+    with banned_rules_guard(config.root):
+        ensure_rules_unchanged()
+        publish_state = _load_publish_state(job_dir / "publish.json")
+        expected_target = Path(publish_state["target_path"]) if publish_state.get("target_path") else (
+            config.output_dir / f"{source.stem}.__rw_{job_id}{source.suffix}"
+        )
+        target_existed = expected_target.exists()
+        output_path = _publish_staged(staged, job_dir, config.output_dir, source.name, job_id)
+        try:
+            ensure_rules_unchanged()
+        except BannedRuleConfigError:
+            if not target_existed and output_path.exists() and _same_text(staged, output_path):
+                output_path.unlink()
+            raise
     logger.info("已保存优化文件: %s", output_path)
 
     if source.exists():

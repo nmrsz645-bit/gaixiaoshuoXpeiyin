@@ -26,6 +26,14 @@ DEFAULT_BANNED_TERMS = """# 每行填写一个违禁词，可用“原词=替换
 # 替换词不能包含任何违禁词；最终全文仍有违禁词时绝不输出或配音。
 # 空行和以 # 开头的说明行会被忽略。
 """
+
+
+class BannedRuleConfigError(ValueError):
+    """The banned-term file is invalid; no novel should consume retries."""
+
+
+class BannedRulesChangedError(BannedRuleConfigError):
+    """The banned-term file changed while a novel was being processed."""
 DEFAULT_AD_COMPLIANCE_RULES = """抖音广告合规补充规则（可自行追加）：
 1. 不得出现真实明星、名人、大师、现实国家机关工作人员、领导人或其肖像、名义、语录；改为不指向真实对象的虚构人物或泛称。
 2. 不得出现现实政治事件、国家政策、国家机关、军队、国旗国徽、人民币、国家标志、国际冲突或借此商业推广的内容。
@@ -46,24 +54,33 @@ def load_banned_rules(root: Path) -> tuple[tuple[str, ...], dict[str, str]]:
     if not path.exists():
         return (), {}
 
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise BannedRuleConfigError(f"指定违禁词文件无法读取或不是 UTF-8 编码：{path}") from exc
+    return parse_banned_rules(content)
+
+
+def parse_banned_rules(content: str) -> tuple[tuple[str, ...], dict[str, str]]:
+
     terms: list[str] = []
     replacements: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
+    for line in content.splitlines():
         term = line.strip()
         if not term or term.startswith("#"):
             continue
         if "=" in term:
             term, replacement = (part.strip() for part in term.split("=", 1))
             if not term or not replacement:
-                raise ValueError("指定违禁词的替换规则不能为空")
+                raise BannedRuleConfigError("指定违禁词的替换规则不能为空")
             if term in replacements and replacements[term] != replacement:
-                raise ValueError(f"指定违禁词 {term} 重复配置了不同替换词")
+                raise BannedRuleConfigError(f"指定违禁词 {term} 重复配置了不同替换词")
             replacements[term] = replacement
         if term not in terms:
             terms.append(term)
     for term, replacement in replacements.items():
         if any(banned in replacement for banned in terms):
-            raise ValueError(f"指定违禁词 {term} 的替换词仍包含违禁词")
+            raise BannedRuleConfigError(f"指定违禁词 {term} 的替换词仍包含违禁词")
     return tuple(terms), replacements
 
 
@@ -94,16 +111,16 @@ def is_aliyun_bailian_url(url: str) -> bool:
     }
 
 
-def validate_optimized_text(source_text: str, optimized_text: str) -> None:
+def validate_optimized_text(source_text: str, optimized_text: str, *, check_length: bool = True) -> None:
     source = source_text.strip()
     optimized = optimized_text.strip()
     if not optimized:
         raise ValueError("DeepSeek 返回内容为空")
     if optimized.startswith("```"):
         raise ValueError("DeepSeek 返回了 Markdown 格式，不是小说正文")
-    if len(optimized) < len(source) * MIN_COMPLETE_RATIO:
+    if check_length and len(optimized) < len(source) * MIN_COMPLETE_RATIO:
         raise ValueError("DeepSeek 返回内容过短，疑似未返回完整小说正文")
-    if len(source) >= 100 and len(optimized) > int(len(source) * MAX_COMPLETE_RATIO):
+    if check_length and len(source) >= 100 and len(optimized) > int(len(source) * MAX_COMPLETE_RATIO):
         raise ValueError("DeepSeek 返回内容过长，疑似添加了新剧情")
     if source_text.count("\n") != optimized_text.count("\n"):
         raise ValueError("DeepSeek 返回的段落或换行数量与原文不一致")
