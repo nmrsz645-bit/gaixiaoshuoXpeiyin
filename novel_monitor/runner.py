@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import AppConfig
 from .file_utils import is_txt_file, move_to_failed, wait_until_stable
-from .processor import claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
+from .processor import BannedTermError, claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
 from .status import MonitorStats
 
 
@@ -20,6 +20,8 @@ class RetryItem:
 
 
 def is_transient_error(error: Exception) -> bool:
+    if isinstance(error, BannedTermError):
+        return False
     text = str(error).lower()
     return any(marker in text for marker in ("timed out", "connection", "temporarily unavailable", "too many requests", "429"))
 
@@ -88,11 +90,12 @@ def _attempt(
             next_retry_at=next_retry_at,
         )
         logger.exception("处理失败，第 %s 次: %s", item.attempts, path)
-        if terminal_attempts >= config.max_retries and not transient:
+        if (isinstance(exc, BannedTermError) or terminal_attempts >= config.max_retries) and not transient:
             moved = move_to_failed(path, config.failed_dir)
             discard_job(path, config)
             queue.pop(path, None)
-            logger.error("已超过最大重试次数，移入失败目录: %s，原因: %s", moved, exc)
+            reason = "违禁词未清除" if isinstance(exc, BannedTermError) else "已超过最大重试次数"
+            logger.error("%s，移入失败目录: %s，原因: %s", reason, moved, exc)
         _log_status(config, logger, stats)
 
 

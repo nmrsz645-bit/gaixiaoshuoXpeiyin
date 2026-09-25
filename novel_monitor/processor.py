@@ -10,12 +10,16 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import AppConfig
-from .deepseek_client import find_banned_terms, load_ad_compliance_rules, load_banned_terms, optimize_text, request_signature, validate_optimized_text
+from .deepseek_client import find_banned_terms, load_ad_compliance_rules, load_banned_rules, load_banned_terms, optimize_text, replace_banned_terms, request_signature, validate_optimized_text
 from .wecom_client import send_file
 
 
 REWRITE_PROCESSING_DIR = ".rewrite-processing"
 LEGACY_WORK_DIR = ".rewrite-work"
+
+
+class BannedTermError(ValueError):
+    """The output still contains a forbidden term and cannot be published."""
 
 
 def read_source_text(path: Path) -> str:
@@ -234,7 +238,7 @@ def process_file(
     logger.info("开始处理: %s", source)
     text = read_source_text(source)
     extra_rules = load_ad_compliance_rules(config.root)
-    banned_terms = load_banned_terms(config.root)
+    banned_terms, replacements = load_banned_rules(config.root)
     if is_claimed_source(source, config):
         job_id = source.parent.name
         job_dir = source.parent
@@ -244,17 +248,21 @@ def process_file(
     rewrite_dir = job_dir / "rewrite"
     staged = rewrite_dir / "staged" / source.name
     staged_metadata = rewrite_dir / "staged.json"
-    generation_signature = request_signature(
-        config.deepseek_model, config.deepseek_url, extra_rules, banned_terms
-    )
+    ai_signature = request_signature(config.deepseek_model, config.deepseek_url, extra_rules, banned_terms)
+    generation_signature = ai_signature
+    if replacements:
+        generation_signature = hashlib.sha256(
+            json.dumps({"ai": ai_signature, "replacements": replacements}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
     webhook_key = hashlib.sha256(config.wechat_webhook_url.encode("utf-8")).hexdigest()
     webhook_sent = rewrite_dir / f"webhook.{webhook_key}.sent"
 
     staged_state = _load_publish_state(staged_metadata)
     if staged.exists() and staged_state.get("request_signature") == generation_signature:
         optimized = staged.read_text(encoding="utf-8-sig")
-        validate_optimized_text(text, optimized)
         remaining_terms = find_banned_terms(optimized, banned_terms)
+        if not remaining_terms:
+            validate_optimized_text(text, optimized)
     else:
         optimized = optimize_text(
             api_key=config.deepseek_api_key,
@@ -269,23 +277,10 @@ def process_file(
             timeout=config.request_timeout_seconds,
         )
 
+        optimized = replace_banned_terms(optimized, replacements)
         remaining_terms = find_banned_terms(optimized, banned_terms)
-        if remaining_terms:
-            logger.warning("首次优化后仍含指定违禁词，准备再次优化: %s", "、".join(remaining_terms))
-            optimized = optimize_text(
-                api_key=config.deepseek_api_key,
-                model=config.deepseek_model,
-                text=optimized,
-                url=config.deepseek_url,
-                extra_rules=extra_rules,
-                banned_terms=banned_terms,
-                checkpoint_dir=rewrite_dir / "second-pass",
-                on_progress=on_progress,
-                max_chars=config.max_request_chars,
-                timeout=config.request_timeout_seconds,
-            )
-            remaining_terms = find_banned_terms(optimized, banned_terms)
         if not remaining_terms:
+            validate_optimized_text(text, optimized)
             _atomic_write_text(staged, optimized)
             _atomic_write_json(
                 staged_metadata,
@@ -296,7 +291,7 @@ def process_file(
                 },
             )
     if remaining_terms:
-        raise ValueError(f"指定违禁词仍存在，未输出未发送：{'、'.join(remaining_terms)}")
+        raise BannedTermError(f"指定违禁词没有可用替换词或替换后仍存在，未输出未发送：{'、'.join(remaining_terms)}")
 
     if not webhook_sent.exists():
         send_file(config.wechat_webhook_url, staged)

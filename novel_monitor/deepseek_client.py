@@ -20,8 +20,10 @@ MAX_COMPLETE_RATIO = 1.3
 CHECKPOINT_CACHE_VERSION = 4
 RULES_FILE_NAME = "抖音广告合规规则.txt"
 BANNED_TERMS_FILE_NAME = "指定违禁词.txt"
-DEFAULT_BANNED_TERMS = """# 每行填写一个必须从输出小说中删除或自然改写的词语。
-# 例如：癌症
+DEFAULT_BANNED_TERMS = """# 每行填写一个违禁词，可用“原词=替换词”指定改写后的固定替换。
+# 例如：抓奸=揭露
+# 只写原词不填替换词时，AI 首轮改写后若仍残留，该书直接进入改写失败。
+# 替换词不能包含任何违禁词；最终全文仍有违禁词时绝不输出或配音。
 # 空行和以 # 开头的说明行会被忽略。
 """
 DEFAULT_AD_COMPLIANCE_RULES = """抖音广告合规补充规则（可自行追加）：
@@ -39,21 +41,45 @@ def load_ad_compliance_rules(root: Path) -> str:
     return path.read_text(encoding="utf-8-sig").strip() if path.exists() else ""
 
 
-def load_banned_terms(root: Path) -> tuple[str, ...]:
+def load_banned_rules(root: Path) -> tuple[tuple[str, ...], dict[str, str]]:
     path = root / BANNED_TERMS_FILE_NAME
     if not path.exists():
-        return ()
+        return (), {}
 
     terms: list[str] = []
+    replacements: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8-sig").splitlines():
         term = line.strip()
-        if term and not term.startswith("#") and term not in terms:
+        if not term or term.startswith("#"):
+            continue
+        if "=" in term:
+            term, replacement = (part.strip() for part in term.split("=", 1))
+            if not term or not replacement:
+                raise ValueError("指定违禁词的替换规则不能为空")
+            if term in replacements and replacements[term] != replacement:
+                raise ValueError(f"指定违禁词 {term} 重复配置了不同替换词")
+            replacements[term] = replacement
+        if term not in terms:
             terms.append(term)
-    return tuple(terms)
+    for term, replacement in replacements.items():
+        if any(banned in replacement for banned in terms):
+            raise ValueError(f"指定违禁词 {term} 的替换词仍包含违禁词")
+    return tuple(terms), replacements
+
+
+def load_banned_terms(root: Path) -> tuple[str, ...]:
+    return load_banned_rules(root)[0]
 
 
 def find_banned_terms(text: str, banned_terms: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(term for term in banned_terms if term in text)
+
+
+def replace_banned_terms(text: str, replacements: dict[str, str]) -> str:
+    if not replacements:
+        return text
+    pattern = re.compile("|".join(re.escape(term) for term in sorted(replacements, key=len, reverse=True)))
+    return pattern.sub(lambda match: replacements[match.group()], text)
 
 
 def is_deepseek_official_url(url: str) -> bool:

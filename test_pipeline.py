@@ -15,6 +15,7 @@ import voice_monitor
 import unified_app
 import novel_monitor.processor as rewrite_processor
 import novel_monitor.monitor_service as rewrite_monitor
+import novel_monitor.runner as rewrite_runner
 from novel_monitor.config import AppConfig
 from novel_monitor import deepseek_client
 from novel_monitor.deepseek_client import validate_optimized_text
@@ -54,7 +55,9 @@ class PipelineTests(unittest.TestCase):
             version_file = Path(temporary) / "version.json"
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.21")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.22")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.22")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.22")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
     def test_aliyun_random_voice_selection_uses_only_known_voices(self):
@@ -682,6 +685,131 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result, text)
         self.assertEqual(calls, ["整段", "甲", "乙", "乙"])
 
+    def test_banned_rules_parse_mapped_and_unmapped_terms(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text(
+                "# 说明\n抓奸=揭露\n出轨\n婚前出轨 = 婚前越界\n",
+                encoding="utf-8",
+            )
+            terms, replacements = deepseek_client.load_banned_rules(root)
+
+        self.assertEqual(terms, ("抓奸", "出轨", "婚前出轨"))
+        self.assertEqual(replacements, {"抓奸": "揭露", "婚前出轨": "婚前越界"})
+
+    def test_banned_replacements_prefer_longest_overlapping_term(self):
+        result = deepseek_client.replace_banned_terms(
+            "婚前出轨，又出轨。", {"出轨": "越界", "婚前出轨": "婚前变心"}
+        )
+        self.assertEqual(result, "婚前变心，又越界。")
+
+    def test_banned_rule_rejects_replacement_containing_another_banned_term(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text(
+                "抓奸=新的出轨\n出轨=越界\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "替换词仍包含违禁词"):
+                deepseek_client.load_banned_rules(root)
+
+    def test_banned_rule_rejects_conflicting_replacements(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text(
+                "抓奸=揭露\n抓奸=披露\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "重复配置了不同替换词"):
+                deepseek_client.load_banned_rules(root)
+
+    def test_mapped_banned_terms_publish_without_second_ai_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text(
+                "抓奸=揭露\n出轨=越界\n婚前出轨=婚前变心\n", encoding="utf-8"
+            )
+            source = config.input_dir / "novel.txt"
+            source.write_text("第一章 起点\n婚前出轨，又去抓奸。", encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]) as optimize, patch.object(rewrite_processor, "send_file"):
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test"))
+
+            self.assertEqual(optimize.call_count, 1)
+            self.assertEqual(result.read_text(encoding="utf-8"), "第一章 起点\n婚前变心，又去揭露。")
+            self.assertFalse(source.exists())
+
+    def test_unmapped_banned_term_is_terminal_without_sending(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("第一章 起点\n众人抓奸之后散去。", encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]) as optimize, patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(rewrite_processor.BannedTermError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+
+            self.assertEqual(optimize.call_count, 1)
+            send.assert_not_called()
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+            self.assertEqual(len(rewrite_processor.recover_claimed_sources(config)), 1)
+
+    def test_unmapped_term_remains_terminal_even_if_replacement_changes_length(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text(
+                "甲=" + ("乙" * 100) + "\n抓奸\n", encoding="utf-8"
+            )
+            source = config.input_dir / "novel.txt"
+            source.write_text("甲抓奸" + ("原" * 100), encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_processor, "send_file"):
+                with self.assertRaises(rewrite_processor.BannedTermError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+
+    def test_banned_term_failure_is_not_mistaken_for_network_retry(self):
+        self.assertFalse(is_transient_error(rewrite_processor.BannedTermError("仍有词条 429")))
+
+    def test_unmapped_banned_term_moves_to_failed_on_first_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source_text = "第一章 起点\n众人抓奸之后散去。"
+            source.write_text(source_text, encoding="utf-8")
+            results = []
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-banned-terminal"), lambda *_: None,
+                lambda *_: None, results.append,
+            )
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_monitor, "process_file", wraps=rewrite_processor.process_file), patch.object(rewrite_processor, "send_file") as send:
+                service.process_once(source)
+
+            failed = list(config.failed_dir.glob("*.txt"))
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(failed[0].read_text(encoding="utf-8"), source_text)
+            self.assertEqual(results, [False])
+            self.assertEqual(service.retry_queue, {})
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+            send.assert_not_called()
+
+    def test_cli_runner_moves_unmapped_banned_term_to_failed_immediately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸之后散去。", encoding="utf-8")
+            queue = {}
+            with patch.object(rewrite_runner, "wait_until_stable", return_value=True), patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_runner, "process_file", wraps=rewrite_processor.process_file), patch.object(rewrite_processor, "send_file") as send:
+                with self.assertLogs("test-banned-cli", level="ERROR") as captured:
+                    rewrite_runner._attempt(source, config, logging.getLogger("test-banned-cli"), queue, rewrite_runner.MonitorStats(started_at=datetime.now()))
+
+            self.assertEqual(len(list(config.failed_dir.glob("*.txt"))), 1)
+            self.assertEqual(queue, {})
+            self.assertNotIn("已超过最大重试次数", "".join(captured.output))
+            send.assert_not_called()
+
     def test_webhook_failure_does_not_publish_or_repeat_ai(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -712,6 +840,28 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertTrue(result.exists())
             self.assertTrue(all(path.parent != config.output_dir for path in send_calls))
+
+    def test_existing_staged_rewrite_without_mappings_remains_reusable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaises(RuntimeError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test"))
+
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            metadata_path = claimed.parent / "rewrite" / "staged.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["request_signature"] = deepseek_client.request_signature(
+                config.deepseek_model, config.deepseek_url, "", ()
+            )
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=AssertionError("old staged rewrite must be reused")), patch.object(rewrite_processor, "send_file"):
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test"))
+
+            self.assertEqual(result.read_text(encoding="utf-8"), "原始正文。" * 10)
 
     def test_staged_rewrite_is_invalidated_when_rules_change(self):
         with tempfile.TemporaryDirectory() as temporary:

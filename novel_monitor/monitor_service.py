@@ -11,7 +11,7 @@ from typing import Callable
 from .config import AppConfig
 from .file_utils import is_txt_file, move_to_failed, wait_until_stable
 from .history import append_history
-from .processor import claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
+from .processor import BannedTermError, claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
 from .runner import RetryItem, is_transient_error, mark_failure, retry_interval_seconds, should_retry
 from .status import MonitorStats
 
@@ -235,7 +235,7 @@ class MonitorService:
             self._emit_log(f"处理失败，第 {item.attempts} 次: {path.name} - {exc}")
             if transient:
                 self._emit_log(f"网络错误，将在约 {int((item.next_retry_at - time.time()) / 60)} 分钟后自动重试：{path.name}")
-            elif terminal_attempts >= self.config.max_retries:
+            elif isinstance(exc, BannedTermError) or terminal_attempts >= self.config.max_retries:
                 moved = move_to_failed(path, self.config.failed_dir)
                 discard_job(path, self.config)
                 with self._state_lock:
