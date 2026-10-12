@@ -56,9 +56,9 @@ class PipelineTests(unittest.TestCase):
             version_file = Path(temporary) / "version.json"
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.23")
-        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.23")
-        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.23")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.24")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.24")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.24")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
     def test_aliyun_random_voice_selection_uses_only_known_voices(self):
@@ -180,6 +180,322 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(engine, "aliyun")
             self.assertTrue(voice_monitor._valid_mp3(output))
             self.assertEqual(aliyun.call_count, 1)
+
+    def test_edge_403_stops_retries_and_never_falls_back_to_aliyun(self):
+        class HandshakeError(Exception):
+            status = 403
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "voice.mp3"
+            config = voice_monitor.default_config()
+            config.update({"engine": "edge_then_aliyun", "edge_retry_count": 3})
+            attempts = []
+
+            async def denied(*_args):
+                attempts.append(True)
+                raise HandshakeError("403, url='wss://example/?ConnectionId=secret'")
+
+            with patch.object(voice_monitor, "edge_synthesize", side_effect=denied), patch.object(voice_monitor.aliyun_tts, "synthesize") as aliyun:
+                with self.assertRaises(voice_monitor.EdgeServiceDeniedError) as caught:
+                    asyncio.run(voice_monitor.synthesize("正文", output, config))
+            self.assertEqual(attempts, [True])
+            self.assertEqual(aliyun.call_count, 0)
+            self.assertNotIn("secret", str(caught.exception))
+            self.assertFalse(output.exists())
+
+    def test_edge_403_pauses_queue_without_failure_and_resumes_after_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            queue.mkdir()
+            first = queue / "a.txt"
+            second = queue / "b.txt"
+            first.write_text("正文甲", encoding="utf-8")
+            second.write_text("正文乙", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({
+                "input_dir": str(queue), "output_dir": str(root / "complete"),
+                "voice_failed_dir": str(root / "voice-failed"),
+                "failed_items_path": str(root / "failed.json"), "engine": "edge",
+                "edge_403_probe_seconds": 60,
+            })
+            voice_monitor.RETRY_STATE.clear()
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+            now = [100.0]
+            attempted = []
+            probes = []
+
+            def processor(path, _config):
+                attempted.append(Path(path).name)
+                if len(attempted) == 1:
+                    raise voice_monitor.EdgeServiceDeniedError("Edge 返回 HTTP 403")
+                Path(path).unlink()
+                return True
+
+            def probe(_config):
+                probes.append(now[0])
+                return len(probes) > 1
+
+            kwargs = dict(processor=processor, stable_checker=lambda *_: True,
+                          clock=lambda: now[0], health_checker=probe)
+            self.assertEqual(voice_monitor.process_once(config, **kwargs), 0)
+            self.assertEqual(len(attempted), 1)
+            self.assertTrue(first.exists() and second.exists())
+            self.assertFalse((root / "failed.json").exists())
+            self.assertEqual(voice_monitor.RETRY_STATE, {})
+            self.assertTrue(voice_monitor.edge_pause_active(config))
+            self.assertTrue(voice_monitor.edge_pause_marker(config).exists())
+            now[0] = 159.0
+            self.assertEqual(voice_monitor.process_once(config, **kwargs), 0)
+            self.assertEqual(probes, [])
+            now[0] = 160.0
+            self.assertEqual(voice_monitor.process_once(config, **kwargs), 0)
+            self.assertEqual(probes, [160.0])
+            self.assertEqual(len(attempted), 1)
+            now[0] = 220.0
+            self.assertEqual(voice_monitor.process_once(config, **kwargs), 2)
+            self.assertEqual(probes, [160.0, 220.0])
+            self.assertFalse(voice_monitor.edge_pause_active(config))
+            self.assertFalse(voice_monitor.edge_pause_marker(config).exists())
+            self.assertFalse(first.exists() or second.exists())
+            self.assertEqual(list((root / "voice-failed").glob("*.txt")), [])
+
+    def test_edge_pause_status_is_visible_while_workers_are_alive(self):
+        service = UnifiedService(lambda *_: None)
+        service.started = True
+        service.rewrite_service = SimpleNamespace(is_running=lambda: True)
+        service.voice_thread = SimpleNamespace(is_alive=lambda: True)
+        with patch.object(voice_monitor, "load_config", return_value=voice_monitor.default_config()), patch.object(voice_monitor, "edge_pause_active", return_value=True):
+            self.assertEqual(service.state(), "Edge 配音暂停")
+
+    def test_aliyun_mode_switch_does_not_claim_edge_probe_succeeded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            edge_config = voice_monitor.default_config()
+            edge_config.update({"input_dir": temporary, "engine": "edge", "poll_seconds": 0})
+            aliyun_config = dict(edge_config, engine="aliyun")
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+            voice_monitor.EDGE_PAUSE_STATE[voice_monitor.edge_pause_key(edge_config)] = 999.0
+            messages = []
+            service = UnifiedService(messages.append)
+            cycles = []
+
+            def one_cycle(*_args, **_kwargs):
+                cycles.append(True)
+                if len(cycles) == 2:
+                    service.stop_event.set()
+                return 0
+
+            with patch.object(voice_monitor, "setup_logging"), patch.object(voice_monitor, "load_config", side_effect=[edge_config, aliyun_config]), patch.object(voice_monitor, "recover_claimed_files"), patch.object(voice_monitor, "process_once", side_effect=one_cycle):
+                service._watch_voice()
+            self.assertFalse(any("探测成功" in message for message in messages))
+            self.assertTrue(any("阿里云" in message for message in messages))
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+
+    def test_edge_pause_survives_restart_and_aliyun_mode_switch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            queue.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(root / "complete"),
+                           "voice_failed_dir": str(root / "failed"), "engine": "edge",
+                           "edge_pause_state_dir": str(root / "pause-state")})
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+            attempts = []
+
+            def denied(*_args):
+                attempts.append("text")
+                raise voice_monitor.EdgeServiceDeniedError("Edge HTTP 403")
+
+            def probe(_config):
+                attempts.append("probe")
+                return True
+
+            voice_monitor.process_once(config, processor=denied,
+                                       stable_checker=lambda *_: True,
+                                       clock=lambda: 100.0, health_checker=probe)
+            self.assertTrue(voice_monitor.edge_pause_marker(config).exists())
+            aliyun_config = dict(config, engine="aliyun")
+            self.assertFalse(voice_monitor.edge_pause_active(aliyun_config))
+            self.assertTrue(voice_monitor.edge_pause_marker(config).exists())
+            voice_monitor.EDGE_PAUSE_STATE.clear()  # 模拟程序进程重启
+            self.assertTrue(voice_monitor.edge_pause_active(config))
+
+            def success(path, _config):
+                attempts.append("text")
+                Path(path).unlink()
+                return True
+
+            self.assertEqual(voice_monitor.process_once(config, processor=success,
+                                                         stable_checker=lambda *_: True,
+                                                         clock=lambda: 101.0,
+                                                         health_checker=probe), 1)
+            self.assertEqual(attempts, ["text", "probe", "text"])
+            self.assertFalse(voice_monitor.edge_pause_marker(config).exists())
+
+    def test_edge_startup_probes_before_book_even_if_pause_marker_could_not_be_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            queue.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(root / "complete"),
+                           "voice_failed_dir": str(root / "failed"), "engine": "edge",
+                           "edge_pause_state_dir": str(root / "pause-state")})
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+            voice_monitor.EDGE_STARTUP_CONFIRMED.clear()
+            events = []
+            atomic_write = voice_monitor._atomic_write_json
+
+            def fail_marker_only(path, data):
+                if Path(path) == voice_monitor.edge_pause_marker(config):
+                    raise OSError("disk full")
+                return atomic_write(path, data)
+
+            def denied(*_args):
+                events.append("book")
+                raise voice_monitor.EdgeServiceDeniedError("Edge HTTP 403")
+
+            with patch.object(voice_monitor, "_atomic_write_json", side_effect=fail_marker_only):
+                voice_monitor.process_once(config, processor=denied,
+                                           stable_checker=lambda *_: True,
+                                           clock=lambda: 100.0,
+                                           health_checker=lambda _: events.append("probe") or True,
+                                           require_startup_probe=True)
+            self.assertEqual(events, ["probe", "book"])
+            self.assertFalse(voice_monitor.edge_pause_marker(config).exists())
+            self.assertTrue(voice_monitor.edge_pause_backup_marker(config).exists())
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+            voice_monitor.EDGE_STARTUP_CONFIRMED.clear()  # 模拟退出重启
+            events.clear()
+
+            def failed_probe(_config):
+                events.append("probe")
+                raise TimeoutError("probe timed out")
+
+            def success(path, _config):
+                events.append("book")
+                Path(path).unlink()
+                return True
+
+            self.assertEqual(voice_monitor.process_once(
+                config, processor=success, stable_checker=lambda *_: True,
+                clock=lambda: 101.0, health_checker=failed_probe,
+                require_startup_probe=True,
+            ), 0)
+            self.assertEqual(events, ["probe"])
+            self.assertTrue(source.exists())
+            self.assertTrue(voice_monitor.edge_pause_backup_marker(config).exists())
+
+    def test_non_403_startup_probe_error_keeps_normal_queue_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            queue.mkdir()
+            (queue / "novel.txt").write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(root / "complete"),
+                           "voice_failed_dir": str(root / "failed"),
+                           "engine": "edge_then_aliyun"})
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+            voice_monitor.EDGE_STARTUP_CONFIRMED.clear()
+            calls = []
+
+            def timed_out(_config):
+                calls.append("probe")
+                raise TimeoutError("probe timed out")
+
+            def process(path, _config):
+                calls.append("book")
+                Path(path).unlink()
+                return True
+
+            self.assertEqual(voice_monitor.process_once(
+                config, processor=process, stable_checker=lambda *_: True,
+                health_checker=timed_out, require_startup_probe=True,
+            ), 1)
+            self.assertEqual(calls, ["probe", "book"])
+            self.assertFalse(voice_monitor.edge_pause_active(config))
+
+    def test_edge_probe_uses_only_short_test_phrase(self):
+        phrases = []
+
+        async def fake_edge(text, output, config):
+            phrases.append(text)
+            self.assertFalse(config["use_random_voice"])
+            Path(output).write_bytes(self.valid_mp3_bytes())
+
+        with patch.object(voice_monitor, "edge_synthesize", side_effect=fake_edge):
+            self.assertTrue(voice_monitor.probe_edge_service(voice_monitor.default_config()))
+        self.assertEqual(phrases, ["接口测试"])
+
+    def test_only_wrapped_edge_403_changes_transient_classification(self):
+        class HandshakeError(Exception):
+            status = 403
+
+        raw = HandshakeError("403 url=wss://example/?ConnectionId=abc")
+        self.assertTrue(voice_monitor.is_transient_voice_error(raw))
+        self.assertFalse(voice_monitor.is_transient_voice_error(
+            voice_monitor.EdgeServiceDeniedError("Edge HTTP 403")
+        ))
+
+    def test_aliyun_403_does_not_trigger_edge_pause(self):
+        class AliyunError(Exception):
+            status = 403
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            queue.mkdir()
+            (queue / "a.txt").write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({
+                "input_dir": str(queue), "output_dir": str(root / "complete"),
+                "voice_failed_dir": str(root / "voice-failed"),
+                "failed_items_path": str(root / "failed.json"), "engine": "aliyun",
+                "max_terminal_failures": 1,
+            })
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+
+            def denied(*_args):
+                raise AliyunError("403")
+
+            voice_monitor.process_once(config, processor=denied,
+                                       stable_checker=lambda *_: True)
+            self.assertFalse(voice_monitor.edge_pause_active(config))
+            self.assertEqual(len(list((root / "voice-failed").glob("*.txt"))), 1)
+
+    def test_aliyun_403_with_connection_text_keeps_existing_retry_behavior(self):
+        class AliyunError(Exception):
+            status = 403
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            queue.mkdir()
+            source = queue / "a.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(root / "complete"),
+                           "voice_failed_dir": str(root / "failed"),
+                           "failed_items_path": str(root / "failed.json"),
+                           "engine": "aliyun", "max_terminal_failures": 1})
+            voice_monitor.RETRY_STATE.clear()
+            voice_monitor.EDGE_PAUSE_STATE.clear()
+
+            def denied(*_args):
+                raise AliyunError("403 URL includes ConnectionId=abc")
+
+            voice_monitor.process_once(config, processor=denied,
+                                       stable_checker=lambda *_: True, clock=lambda: 100.0)
+            self.assertTrue(source.exists())
+            self.assertEqual(list((root / "failed").glob("*.txt")), [])
+            self.assertFalse(voice_monitor.edge_pause_active(config))
+            self.assertEqual(voice_monitor.failed_attempts(source, root / "failed.json"), 0)
 
     def test_long_mp3_is_trimmed_to_35_minutes_atomically(self):
         with tempfile.TemporaryDirectory() as temporary:

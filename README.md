@@ -22,6 +22,8 @@ py -3.13 -m venv .venv
 
 ## 测试与构建
 
+Edge 语音 WebSocket 返回 HTTP 403 时，配音队列暂停：当前 TXT 归还待配音目录，不增加失败次数，也不自动切换阿里云。暂停状态保存在待配音目录的 `.edge-403-paused.json`（必要时保存在程序 `data` 目录）；有待配音 TXT 时，每 30 分钟用固定短句探测，生成有效 MP3 后才恢复。程序启动后的首次待配音任务也先做一次短句探测；非 403 探测故障仍按原有引擎配置处理。此逻辑只防止队列反复失败，不能修复 Edge 服务端的 403。若两个状态目录都无法写入，暂停状态无法保证跨重启保留，须先处理存储故障。
+
 ```powershell
 python -m py_compile unified_app.py voice_monitor.py test_pipeline.py
 python -m unittest test_pipeline.py
