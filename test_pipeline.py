@@ -56,9 +56,9 @@ class PipelineTests(unittest.TestCase):
             version_file = Path(temporary) / "version.json"
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.25")
-        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.25")
-        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.25")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.26")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.26")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.26")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
     def test_aliyun_random_voice_selection_uses_only_known_voices(self):

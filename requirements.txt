@@ -1,5 +1,5 @@
 requests==2.32.4
-edge-tts
+edge-tts==7.2.5
 imageio-ffmpeg==0.6.0
 aliyun-python-sdk-core
 aliyun-python-sdk-nls-cloud-meta
