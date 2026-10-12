@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -32,72 +31,6 @@ PID_PATH = BASE_DIR / "voice_monitor.pid"
 START_TIME_PATH = BASE_DIR / "monitor_start_time.txt"
 CURRENT_TASK_PATH = BASE_DIR / "current_task.txt"
 RETRY_STATE = {}
-EDGE_PAUSE_STATE = {}
-EDGE_STARTUP_CONFIRMED = set()
-
-
-class EdgeServiceDeniedError(RuntimeError):
-    """The Edge speech WebSocket rejected this client with HTTP 403."""
-
-
-def is_edge_http_403(error):
-    return getattr(error, "status", None) == 403 or isinstance(error, EdgeServiceDeniedError)
-
-
-def edge_pause_key(config):
-    return str(Path(config["input_dir"]).resolve())
-
-
-def edge_pause_marker(config):
-    return Path(config["input_dir"]) / ".edge-403-paused.json"
-
-
-def edge_pause_backup_marker(config):
-    directory = Path(config.get("edge_pause_state_dir") or BASE_DIR / "data")
-    queue_hash = hashlib.sha256(edge_pause_key(config).encode("utf-8")).hexdigest()[:24]
-    return directory / f"edge-403-{queue_hash}.json"
-
-
-def edge_pause_marker_exists(config):
-    return edge_pause_marker(config).exists() or edge_pause_backup_marker(config).exists()
-
-
-def write_edge_pause_marker(config):
-    try:
-        _atomic_write_json(edge_pause_marker(config), {"reason": "edge_http_403"})
-    except OSError as primary_error:
-        try:
-            _atomic_write_json(edge_pause_backup_marker(config), {"reason": "edge_http_403"})
-        except OSError as backup_error:
-            logging.error(
-                "Edge 暂停状态无法持久保存（队列目录 %s，备用目录 %s）；当前进程保持暂停，重启后需检查存储故障和队列状态。",
-                type(primary_error).__name__, type(backup_error).__name__,
-            )
-        else:
-            logging.warning("Edge 暂停标记未能写入队列目录，已保存到程序备用状态目录。")
-
-
-def edge_pause_active(config=None):
-    if config is None:
-        return bool(EDGE_PAUSE_STATE)
-    if config.get("engine") == "aliyun":
-        return False
-    return edge_pause_key(config) in EDGE_PAUSE_STATE or edge_pause_marker_exists(config)
-
-
-def edge_probe_interval(config):
-    return max(60, int(config.get("edge_403_probe_seconds", 1800)))
-
-
-def probe_edge_service(config):
-    """Check the same audio path with a short, non-business phrase."""
-    probe_config = dict(config)
-    probe_config["use_random_voice"] = False
-    probe_config["voice"] = "zh-CN-XiaoxiaoNeural"
-    with tempfile.TemporaryDirectory(prefix="edge-voice-probe-") as temporary:
-        output = Path(temporary) / "probe.mp3"
-        asyncio.run(edge_synthesize("接口测试", output, probe_config))
-        return _valid_mp3(output)
 
 
 class VoiceBannedTermError(ValueError):
@@ -159,7 +92,6 @@ def default_config():
         "pitch": "+0Hz",
         "volume": "+0%",
         "edge_retry_count": 3,
-        "edge_403_probe_seconds": 1800,
         "edge_idle_timeout_seconds": 120,
         "poll_seconds": 5,
         "stable_seconds": 15,
@@ -803,9 +735,7 @@ async def edge_synthesize_with_retry(text, output_path, config, synthesize_func=
         try:
             await synthesize_func(text, output_path, config)
             return
-        except Exception as exc:
-            if is_edge_http_403(exc):
-                raise EdgeServiceDeniedError("Edge 语音服务返回 HTTP 403，已暂停配音等待服务恢复。") from exc
+        except Exception:
             if attempt >= retry_count:
                 raise
             delay = 5 * (2 ** attempt)
@@ -834,8 +764,6 @@ async def synthesize(text, output_path, config):
         try:
             await edge_synthesize_with_retry(text, output_path, config)
             return "edge"
-        except EdgeServiceDeniedError:
-            raise
         except Exception as exc:
             logging.warning("Edge 配音失败，自动切换阿里云：%s", exc)
             await use_aliyun()
@@ -973,8 +901,6 @@ def retry_delay_seconds(failures):
 
 
 def is_transient_voice_error(error):
-    if isinstance(error, EdgeServiceDeniedError):
-        return False
     if isinstance(error, (VoiceBannedTermError, BannedRuleConfigError)):
         return False
     transient_type_names = {"TimeoutError", "ConnectionError", "gaierror"}
@@ -999,56 +925,8 @@ def process_once(
     clock=time.monotonic,
     on_failure=None,
     stop_checker=lambda: False,
-    health_checker=probe_edge_service,
-    require_startup_probe=False,
 ):
     ensure_dirs(config)
-    pause_key = edge_pause_key(config)
-    marker = edge_pause_marker(config)
-    backup_marker = edge_pause_backup_marker(config)
-    if (require_startup_probe and config.get("engine") != "aliyun"
-            and pause_key not in EDGE_STARTUP_CONFIRMED
-            and pause_key not in EDGE_PAUSE_STATE and not edge_pause_marker_exists(config)):
-        if stop_checker() or not find_text_files(config):
-            return 0
-        denied = False
-        try:
-            healthy = health_checker(config)
-        except Exception as exc:
-            denied = is_edge_http_403(exc)
-            healthy = False
-        if denied:
-            write_edge_pause_marker(config)
-            EDGE_PAUSE_STATE[pause_key] = clock() + edge_probe_interval(config)
-            logging.warning("Edge 启动短句探测返回 HTTP 403；未发送正文，配音暂停。")
-            return 0
-        if not healthy:
-            logging.warning("Edge 启动探测未通过但非 HTTP 403；继续按原配音配置处理。")
-        EDGE_STARTUP_CONFIRMED.add(pause_key)
-    if config.get("engine") != "aliyun" and edge_pause_marker_exists(config) and pause_key not in EDGE_PAUSE_STATE:
-        # A restarted process must prove the short probe before it sends a book.
-        EDGE_PAUSE_STATE[pause_key] = clock()
-    if config.get("engine") != "aliyun" and pause_key in EDGE_PAUSE_STATE:
-        if stop_checker() or clock() < EDGE_PAUSE_STATE[pause_key] or not find_text_files(config):
-            return 0
-        try:
-            healthy = health_checker(config)
-        except Exception:
-            healthy = False
-        if not healthy:
-            EDGE_PAUSE_STATE[pause_key] = clock() + edge_probe_interval(config)
-            logging.warning("Edge 短句探测仍未通过；配音保持暂停，TXT 保留在队列。")
-            return 0
-        try:
-            marker.unlink(missing_ok=True)
-            backup_marker.unlink(missing_ok=True)
-        except OSError:
-            EDGE_PAUSE_STATE[pause_key] = clock() + edge_probe_interval(config)
-            logging.exception("Edge 探测成功，但暂停标记未能清除；配音继续暂停。")
-            return 0
-        EDGE_PAUSE_STATE.pop(pause_key, None)
-        EDGE_STARTUP_CONFIRMED.add(pause_key)
-        logging.info("Edge 短句探测成功，恢复配音队列。")
     force_retry = consume_retry_failed()
     if force_retry:
         RETRY_STATE.clear()
@@ -1086,13 +964,6 @@ def process_once(
             if claimed is None:
                 logging.exception("配音文件领取失败，将在下一轮重试: %s", text_path)
                 continue
-            if isinstance(exc, EdgeServiceDeniedError) and config.get("engine") != "aliyun":
-                write_edge_pause_marker(config)
-                if Path(claimed).exists():
-                    release_claim(claimed, config)
-                EDGE_PAUSE_STATE[pause_key] = clock() + edge_probe_interval(config)
-                logging.error("Edge 语音服务返回 HTTP 403；配音暂停，TXT 已留在队列，未计入失败次数。")
-                break
             if isinstance(exc, BannedRuleConfigError):
                 if Path(claimed).exists():
                     released = release_claim(claimed, config)
@@ -1153,10 +1024,7 @@ def watch_forever(config=None, config_loader=load_config, processor=process_once
                 recover_claimed_files(current_config)
                 logging.info("开始监控: %s", current_config["input_dir"])
                 logging.info("输出目录: %s", current_config["output_dir"])
-                if processor is process_once:
-                    processor(current_config, stop_checker=stop_checker, require_startup_probe=True)
-                else:
-                    processor(current_config, stop_checker=stop_checker)
+                processor(current_config, stop_checker=stop_checker)
                 poll_seconds = int(current_config.get("poll_seconds", 5))
             except Exception:
                 logging.exception("监控循环异常，将在下一轮重试")
@@ -1174,7 +1042,7 @@ def main():
     setup_logging()
     config = load_config()
     if args.once:
-        process_once(config, require_startup_probe=True)
+        process_once(config)
     else:
         watch_forever(config)
 

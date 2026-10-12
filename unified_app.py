@@ -88,7 +88,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.24"
+DEFAULT_APP_VERSION = "1.0.25"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -494,11 +494,6 @@ class UnifiedService:
         if self.stop_event.is_set():
             return "正在停止" if rewrite_alive or voice_alive else "已停止"
         if rewrite_alive and voice_alive:
-            try:
-                if voice_monitor.edge_pause_active(voice_monitor.load_config()):
-                    return "Edge 配音暂停"
-            except (OSError, ValueError):
-                pass
             return "运行中"
         if rewrite_alive or voice_alive:
             return "故障"
@@ -604,29 +599,16 @@ class UnifiedService:
 
     def _watch_voice(self) -> None:
         voice_monitor.setup_logging()
-        was_edge_paused = False
-        previous_engine = None
         while not self.stop_event.is_set():
             try:
                 config = voice_monitor.load_config()
-                pause_before = voice_monitor.edge_pause_active(config)
                 voice_monitor.recover_claimed_files(config)
                 count = voice_monitor.process_once(
                     config,
                     processor=lambda path, current: voice_monitor.process_file(path, current, on_success=self._on_voice_success),
                     on_failure=self._on_voice_failure,
                     stop_checker=self.stop_event.is_set,
-                    require_startup_probe=True,
                 )
-                edge_paused = voice_monitor.edge_pause_active(config)
-                if edge_paused and not pause_before:
-                    self.on_log("Edge 配音已暂停：服务返回 403 或短句探测未通过；TXT 保留，不计失败次数，不自动切换阿里云。")
-                elif pause_before and not edge_paused:
-                    self.on_log("Edge 短句探测成功：配音队列已恢复。")
-                elif previous_engine != "aliyun" and config.get("engine") == "aliyun" and was_edge_paused:
-                    self.on_log("已切换为阿里云配音；Edge 暂停标记保留，切回 Edge 前仍需探测。")
-                was_edge_paused = edge_paused
-                previous_engine = config.get("engine")
                 if count:
                     self.on_log(f"配音完成 {count} 个文件。")
                 delay = int(config.get("poll_seconds", 5))
