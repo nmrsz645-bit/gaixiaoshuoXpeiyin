@@ -93,7 +93,7 @@ def main() -> None:
             "version": args.version,
             "notes": args.notes or f"国内 OSS 更新 v{args.version}",
             "url": f"{OSS_UPDATE_ROOT}/releases/{args.version}/{app_zip.name}",
-            "fullPackageUrl": f"{OSS_UPDATE_ROOT}/novel-processing-center-{args.version}-windows-x64.zip",
+            "fullPackageUrl": f"{OSS_UPDATE_ROOT}/releases/{args.version}/{full_zip.name}",
             "fullPackageSha256": sha256(full_zip),
         }
         (output / "latest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
