@@ -4988,7 +4988,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(source.exists())
 
     def test_relative_receipt_path_for_same_audio_is_not_deleted(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
             queue, complete = root / "queue", root / "complete"
             queue.mkdir()

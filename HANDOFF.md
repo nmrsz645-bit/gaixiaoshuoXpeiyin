@@ -52,7 +52,7 @@ cmd /c run_tests.bat
 
 测试不需要 Key，不调用真实 AI/TTS/Webhook。普通 GUI 启动会初始化配置，并在约 300 ms 后尝试启动处理；务必用没有真实任务/凭据的隔离副本。
 
-若 Windows 的 TEMP 在不同盘，`test_relative_receipt_path_for_same_audio_is_not_deleted` 会在 os.path.relpath 失败：这是该测试夹具的同盘假设。本轮首次正式版 409 项中该项出错，以下隔离环境重跑后全部通过；不要改动全局 TEMP 或删任务来解决测试。
+首次标签的 GitHub Windows 回归也复现了跨盘 TEMP 的 os.path.relpath 测试夹具错误。后续维护提交将该测试的 TemporaryDirectory 显式放到 Path.cwd()，当前分支不再依赖 TEMP 所在盘，默认回归已在跨盘环境通过。应用逻辑、版本和原始 Windows 包未改变，既有 v1.0.30/v1.0.31-beta 标签未重打。开发请取最新 main/测试分支；若复验原标签，则可使用下述同盘临时目录配置。
 
 ```powershell
 $taskTemp = Join-Path (Get-Location) '.test-temp'
@@ -96,3 +96,7 @@ API Key/Webhook 以本地文件保存，应通过 GUI 管理。阿里云 AccessK
 ## 更新器组件源码缺口
 
 应用 Python 源码、测试和打包入口齐备；UpdateAgent 当前仅保留固定二进制与产品配置，其原始源码尚未对应确认，不能宣称所有组件源码均可重建。固定 SHA-256、实际类型、产品字段、排除的同名候选及维护入口见 [docs/updater-dependency.md](docs/updater-dependency.md)。本轮未替换更新器或执行生产更新。
+
+## 标签与后续维护提交
+
+程序标签保留最初的源码/文档快照；最新分支另有跨盘测试夹具及文档维护提交。它只影响离线测试的临时目录，不影响应用代码或已发布字节。Release 说明列出两类提交，不能把维护提交误当成新程序版本。GitHub 标签首次自动构建在测试阶段失败，未执行打包；后续分支回归状态应按实际 Actions 结果读取。

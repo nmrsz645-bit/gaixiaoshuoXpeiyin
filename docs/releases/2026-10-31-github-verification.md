@@ -45,3 +45,9 @@
 ## 保留的组件源码缺口
 
 应用 Python 源码完整，原更新器实现目前仍只保留固定二进制及产品配置；未确认其原始源码，不能据此宣称所有组件源码均可重建。B站 C# 与掌心 Python 同名实现已排除，未修改这两个项目。详见 [更新器维护边界](../updater-dependency.md)。
+
+## 发布草稿阶段新增验证
+
+GitHub Windows runner 的源码在 D 盘、TEMP 在 C 盘，首次标签的自动回归因此在相对回执路径夹具上失败，打包步骤没有执行。后续普通维护提交只把该夹具的 TemporaryDirectory 放到 Path.cwd()；两条分支在默认跨盘环境分别 409/416 项通过。应用源代码与 Windows 文件均未更改，原标签保持不动；远端维护提交的 Actions 需在发布前另外核实。
+
+GitHub 自动规整中文附件名，故 Release 使用 USER-GUIDE.txt 与 novel-processing-center-1.0.31-beta-setup.exe 等 ASCII 名称；只更改附件名称，不改变程序字节。SHA256SUMS.txt 按实际附件名称重新生成，所有调整在尚未公开的本次新草稿中完成，不替换历史 Release。

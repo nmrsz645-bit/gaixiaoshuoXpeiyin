@@ -71,7 +71,7 @@ cmd /c run_tests.bat
 .\.venv\Scripts\python.exe unified_app.py
 ```
 
-`requirements.txt` 是直接依赖；`requirements-windows-verified.txt` 固定了本轮通过测试的依赖闭包。先读 HANDOFF 的安全边界再启动 GUI，因为源码运行也会建立本地配置并尝试自动处理。跨盘临时目录导致 `os.path.relpath` 测试失败时，按 HANDOFF 将测试临时目录设在仓库同盘。
+`requirements.txt` 是直接依赖；`requirements-windows-verified.txt` 固定了本轮通过测试的依赖闭包。先读 HANDOFF 的安全边界再启动 GUI，因为源码运行也会建立本地配置并尝试自动处理。首次标签曾暴露跨盘临时目录夹具问题，最新维护分支已修复；复验原标签时按 HANDOFF 使用同盘测试临时目录。程序标签和已发布包均未替换。
 
 构建命令、NSIS 要求、GitHub 与生产更新的区别、源码和实际包的关联，以及未执行项目均在 [HANDOFF.md](HANDOFF.md)。
 
