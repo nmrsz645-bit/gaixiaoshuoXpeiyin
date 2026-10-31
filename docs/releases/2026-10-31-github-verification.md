@@ -51,3 +51,7 @@
 GitHub Windows runner 的源码在 D 盘、TEMP 在 C 盘，首次标签的自动回归因此在相对回执路径夹具上失败，打包步骤没有执行。后续普通维护提交只把该夹具的 TemporaryDirectory 放到 Path.cwd()；两条分支在默认跨盘环境分别 409/416 项通过。应用源代码与 Windows 文件均未更改，原标签保持不动；远端维护提交的 Actions 需在发布前另外核实。
 
 GitHub 自动规整中文附件名，故 Release 使用 USER-GUIDE.txt 与 novel-processing-center-1.0.31-beta-setup.exe 等 ASCII 名称；只更改附件名称，不改变程序字节。SHA256SUMS.txt 按实际附件名称重新生成，所有调整在尚未公开的本次新草稿中完成，不替换历史 Release。
+
+## 后续正式源码版本元数据维护
+
+正式根 version.json 和显示回退现已对齐 1.0.30。原 22 模块逐字节核对针对原标签源码；最新维护源码额外有一项版本显示字面值修正，AI/队列/配音算法没有变化。已验证正常版本文件、坏 JSON/缺失文件回退，完整 409 项通过。原包及标签不变，详细链路和当前差异见 [源版本元数据核验](2026-10-31-source-version-metadata.md)。

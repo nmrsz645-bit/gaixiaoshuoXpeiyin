@@ -10,7 +10,7 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 - 正式版源码主仓库是公开的 `nmrsz645-bit/gaixiaoshuoXpeiyin`。私有 `nmrsz645-bit/novel-processing-center` 保存同源正式版及独立测试分支，不改变其私有权限。
 - 正式版仍为 **1.0.30**；**1.0.31-beta 是测试版**。版本数字较大不表示已通过正式发布验收。GitHub Release 与 OSS 客户端更新是两个独立渠道。
 - 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [本轮核验记录](docs/releases/2026-10-31-github-verification.md)。
-- 本分支业务源码对应正式 1.0.30；源码根 `version.json` 保留历史开发标记 1.0.26，构建时必须显式传 `--version 1.0.30`。Windows 发布包的实际版本为 1.0.30。
+- 本分支根 `version.json` 和源码显示回退值均为 **1.0.30**。源码启动读取该文件，构建也必须显式传 `--version 1.0.30`；旧标签中的 1.0.26 开发元数据已在后续维护分支修正，原 Windows 包和标签保持不变。
 
 ## Windows 安装与启动
 

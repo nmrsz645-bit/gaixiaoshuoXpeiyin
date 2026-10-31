@@ -3,7 +3,7 @@
   "version": "1.0.30",
   "channel": "stable",
   "original_build_source_commit": "ad6c3aa3f32139102c55630cb6017d2c45bb8018",
-  "source_version_marker": "1.0.26",
+  "source_version_marker": "1.0.30",
   "application_source_hash_normalization": "CRLF converted to LF; other bytes unchanged",
   "application_sources": [
     {
@@ -104,7 +104,7 @@
     },
     {
       "path": "unified_app.py",
-      "sha256": "5732145e06a15d4f7a4e3ab4354611701c1a0143e3356584702a1ca399026912"
+      "sha256": "7b039b9f550e17d49b4c960964624d68b79172da0b838b12e0321782b88f9962"
     },
     {
       "path": "voice_monitor.py",
@@ -121,6 +121,8 @@
       "sha256": "757eea0f5e93fffe0127486837bab09d251d30271576264bbc310e0ba87f0a46"
     }
   ],
-  "runtime_code_modified_for_github_completion": false,
-  "updater_original_source_status": "not_confirmed; fixed binary dependency documented in docs/updater-dependency.md"
+  "runtime_code_modified_for_github_completion": true,
+  "updater_original_source_status": "not_confirmed; fixed binary dependency documented in docs/updater-dependency.md",
+  "runtime_change_scope": "Only DEFAULT_APP_VERSION display fallback 1.0.26 to 1.0.30; business algorithms unchanged; immutable Windows packages and tags untouched",
+  "bundle_code_verification_reference": "Original v1.0.30 tag 72268308babcb1f81ee17af760ffdda237c80343; maintenance source has the declared display metadata difference"
 }
