@@ -1,12 +1,14 @@
 # 下一位 Codex：小说处理中心 1.0.30
 
+> 新 Windows 接手、环境、构建、版本、OSS/网站、验收回滚和凭据：**[完整发布指南](docs/RELEASE-GUIDE.md)**。
+
 更新日期：2026-10-31。先读本文件、README 和 AGENTS，再核对远端实际状态；旧文档中的盘符、版本或历史测试数字不作为当前依据。
 
 ## 用途、版本与仓库关系
 
 - 用途：Windows 本地 TXT 改写/可选场景审改、企业微信发送、Edge/阿里云配音和可恢复文件队列。
 - 本分支版本：**1.0.30，正式版**；目标仓库 `nmrsz645-bit/gaixiaoshuoXpeiyin`，分支 `main`，发布标签 `v1.0.30`。
-- 正式主仓库 `nmrsz645-bit/gaixiaoshuoXpeiyin` 为公开仓库，正式版 1.0.30。私有 `nmrsz645-bit/novel-processing-center` 的 main 为同源正式版镜像，feature/ui-installer-1.0.31 为测试版；不得将测试版误标稳定版或把私有新增源码擅自转为公开。
+- 本公开仓库 main 维护正式版 1.0.30；测试版单独维护，不得误标稳定版或擅自公开私有新增源码。
 - 原始构建源提交：`ad6c3aa3f32139102c55630cb6017d2c45bb8018`。正式版的发布记录基础提交为 `3260809b9fc1a2f31a4ff675ddca214a103443ce`；测试版在该基础上演进。
 - 本次只补齐 GitHub 源码、文档和 Release，沿用已有 Windows 包，不重新生成同版本包。最终发布源码提交以 `git rev-parse v1.0.30^{commit}` 及 Release 标签为准；对照核验记录的源提交和逐模块包内代码核对。
 - 当前正式源码根 `version.json` 与 `unified_app.DEFAULT_APP_VERSION` 均为 1.0.30。`read_app_version` 先读取源码/安装目录的该文件，缺失或损坏时才用回退值；便捷构建批处理会复制该文件，Python 构建工具则用显式 `--version` 写入包版本。原 v1.0.30 标签的开发元数据曾为 1.0.26，后续源码维护修正了显示元数据，不重打标签、不替换已发布程序。

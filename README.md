@@ -1,5 +1,7 @@
 # 小说处理中心 1.0.30
 
+> 新 Windows 接手、环境、构建、版本、OSS/网站、验收回滚和凭据：**[完整发布指南](docs/RELEASE-GUIDE.md)**。
+
 Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配音工具。当前状态：**正式版**。
 
 流程：`待改小说 → AI 改写/审改 → 企业微信发送 → 已改完成 → 配音 → 完成（TXT + MP3）`。
@@ -7,7 +9,7 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 ## 版本、源码和下载
 
 - 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.30) 含可运行 Windows 包、校验文件及说明文档。
-- 正式版源码主仓库是公开的 `nmrsz645-bit/gaixiaoshuoXpeiyin`。私有 `nmrsz645-bit/novel-processing-center` 保存同源正式版及独立测试分支，不改变其私有权限。
+- 本公开仓库维护正式版源码；测试版单独维护，不能误标为稳定版或擅自公开测试源码。
 - 正式版仍为 **1.0.30**；**1.0.31-beta 是测试版**。版本数字较大不表示已通过正式发布验收。GitHub Release 与 OSS 客户端更新是两个独立渠道。
 - 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [本轮核验记录](docs/releases/2026-10-31-github-verification.md)。
 - 本分支根 `version.json` 和源码显示回退值均为 **1.0.30**。源码启动读取该文件，构建也必须显式传 `--version 1.0.30`；旧标签中的 1.0.26 开发元数据已在后续维护分支修正，原 Windows 包和标签保持不变。
