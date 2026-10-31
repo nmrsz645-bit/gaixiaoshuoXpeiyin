@@ -104,3 +104,7 @@ API Key/Webhook 以本地文件保存，应通过 GUI 管理。阿里云 AccessK
 ## 正式源版本元数据维护
 
 根 version.json 确实参与源码启动和旧批处理打包，不是闲置文件；已与显示回退统一为 1.0.30。原标签及 Windows 包未重打/替换。最新源码只有显示回退常量与原包对应应用源码不同，明确差异、AST 核对和版本来源见 [源版本元数据核验](docs/releases/2026-10-31-source-version-metadata.md)。
+
+## GitHub Latest 生产兼容约束
+
+最新正式程序为 1.0.30，但 GitHub Latest 标记保留在 v1.0.18，因为旧更新器固定读取 releases/latest/download/latest.json。最新程序人工下载使用版本专属 v1.0.30 Release；新补传使用 --latest=false，迁移旧更新通道必须另核生产授权。旧入口已回读恢复原清单 SHA-256，细节见 [兼容入口](docs/legacy-github-update-compatibility.md)。

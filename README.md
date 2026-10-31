@@ -12,6 +12,10 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 - 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [本轮核验记录](docs/releases/2026-10-31-github-verification.md)。
 - 本分支根 `version.json` 和源码显示回退值均为 **1.0.30**。源码启动读取该文件，构建也必须显式传 `--version 1.0.30`；旧标签中的 1.0.26 开发元数据已在后续维护分支修正，原 Windows 包和标签保持不变。
 
+## GitHub Latest 兼容约束
+
+最新正式程序为 1.0.30，使用上方版本专属 Release 链接下载。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
+
 ## Windows 安装与启动
 
 1. 从对应 Release 下载完整 Windows ZIP（测试版另提供安装 EXE），并用 `Get-FileHash -Algorithm SHA256` 与 `SHA256SUMS.txt` 核对。

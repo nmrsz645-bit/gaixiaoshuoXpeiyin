@@ -8,3 +8,5 @@
 6. 只提交完整源码、安全模板和脱敏说明。审查当前文件及本次新增历史，禁止密钥、个人/业务数据、浏览器资料和聊天记录进入 Git；禁止 git add -f 绕过保护。
 7. 回归：cmd /c run_tests.bat；测试版另运行 python -m unittest test_desktop_shortcut.py。Windows 跨盘 TEMP 的测试夹具问题按 HANDOFF 用同盘临时目录处理。
 8. 完成后用真实输出报告版本、源码提交、测试及未验证项；更新 README/HANDOFF 和核验记录，不把本地包、源码推送、GitHub Release、生产升级与真实业务成功混称。
+
+9. GitHub Latest 为旧客户端生产兼容锚点 v1.0.18；新正式程序 1.0.30 使用版本专属 Release 下载。GitHub 补传不要默认设置 Latest，先读 docs/legacy-github-update-compatibility.md，改变旧更新通道须单独授权。
