@@ -10,7 +10,7 @@ from typing import Callable
 
 from .config import AppConfig
 from .deepseek_client import BannedRuleConfigError, load_banned_rules
-from .file_utils import is_txt_file, move_to_failed, wait_until_stable
+from .file_utils import is_txt_file, move_to_failed, rewrite_name_conflict, title_claim_guard, wait_until_stable
 from .history import append_history
 from .processor import BannedTermError, claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
 from .runner import RetryItem, is_transient_error, mark_failure, retry_interval_seconds, should_retry
@@ -27,12 +27,14 @@ class MonitorService:
         on_status: Callable[[MonitorStats], None],
         on_log: Callable[[str], None],
         on_result: Callable[[bool], None] | None = None,
+        voice_output_dir: Path | Callable[[], Path] | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
         self.on_status = on_status
         self.on_log = on_log
         self.on_result = on_result
+        self.voice_output_dir = voice_output_dir
         self.stats = MonitorStats(started_at=datetime.now())
         self.retry_queue: dict[Path, RetryItem] = {}
         self._stop = threading.Event()
@@ -42,6 +44,15 @@ class MonitorService:
         self._in_flight: set[Path] = set()
         self._active: dict[Path, dict] = {}
         self._state_lock = threading.RLock()
+        self._name_lock = threading.RLock()
+        self._waiting_names: dict[Path, Path] = {}
+
+    def _name_conflict(self, source: Path) -> Path | None:
+        voice_output_dir = self.voice_output_dir() if callable(self.voice_output_dir) else self.voice_output_dir
+        return rewrite_name_conflict(
+            source, self.config.input_dir, self.config.output_dir,
+            Path(voice_output_dir) if voice_output_dir else None,
+        )
 
     def is_running(self) -> bool:
         with self._state_lock:
@@ -161,18 +172,39 @@ class MonitorService:
         active_path: Path | None = None
         try:
             load_banned_rules(self.config.root)
-            if not is_claimed_source(path, self.config):
+            claimed = is_claimed_source(path, self.config)
+            if not claimed:
                 if not wait_until_stable(path, self.config.stable_seconds):
                     self._emit_log(f"文件消失或无法稳定: {path}")
                     return
                 if self._stop.is_set():
                     return
-                try:
-                    path = claim_source(path, self.config)
-                except FileNotFoundError:
-                    return
+                with self._name_lock, title_claim_guard(self.config.input_dir, path.name) as acquired:
+                    if not acquired:
+                        return
+                    conflict = self._name_conflict(path)
+                    if conflict:
+                        if self._waiting_names.get(path) != conflict:
+                            self._waiting_names[path] = conflict
+                            self._emit_log(f"同名文件仍在，改写等待：{path.name}（占用：{conflict}）")
+                        return
+                    if self._waiting_names.pop(path, None):
+                        self._emit_log(f"同名文件已移走，恢复改写：{path.name}")
+                    try:
+                        path = claim_source(path, self.config)
+                    except FileNotFoundError:
+                        return
                 if self._stop.is_set():
                     return
+            else:
+                conflict = self._name_conflict(path)
+                if conflict:
+                    if self._waiting_names.get(path) != conflict:
+                        self._waiting_names[path] = conflict
+                        self._emit_log(f"同名文件仍在，改写等待：{path.name}（占用：{conflict}）")
+                    return
+                if self._waiting_names.pop(path, None):
+                    self._emit_log(f"同名文件已移走，恢复改写：{path.name}")
             active_path = path
             with self._state_lock:
                 self._active[active_path] = {

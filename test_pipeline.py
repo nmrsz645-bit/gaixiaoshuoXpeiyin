@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ import re
 import tempfile
 import threading
 import unittest
+import requests
 from datetime import date, datetime, timedelta
 from dataclasses import replace
 from pathlib import Path
@@ -17,11 +19,13 @@ import unified_app
 import novel_monitor.processor as rewrite_processor
 import novel_monitor.monitor_service as rewrite_monitor
 import novel_monitor.runner as rewrite_runner
-from novel_monitor.config import AppConfig
+from novel_monitor.config import AppConfig, load_config
 from novel_monitor import deepseek_client
+from novel_monitor import semantic_compliance
 from novel_monitor.deepseek_client import validate_optimized_text
 import novel_monitor.history as history_store
 from novel_monitor.history import append_history, prune_history
+from novel_monitor.file_utils import title_claim_guard, same_title
 from novel_monitor.logging_setup import cleanup_old_logs
 from novel_monitor.runner import is_transient_error
 from unified_app import ALIYUN_VOICES, BAILIAN_AI_SERVICE, BAILIAN_MODEL_CHOICES, COMPLETE_DIR, DEFAULT_APP_VERSION, OFFICIAL_AI_SERVICE, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, ai_service_for_url, app_window_title, configured_output_dir, configured_source_dir, normalize_aliyun_random_voices, normalize_random_voices, read_app_version, rebase_managed_paths, test_interfaces
@@ -42,6 +46,2825 @@ class PipelineTests(unittest.TestCase):
         for folder in (source, output, failed, logs):
             folder.mkdir()
         return AppConfig(root, source, output, failed, logs, "key", "webhook", "model", 0, 0, 3)
+
+    def test_semantic_mode_defaults_off_in_old_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "config.json"
+            for value, expected in (({}, False), ({"semanticComplianceEnabled": "true"}, False), ({"semanticComplianceEnabled": True}, True)):
+                settings.write_text(json.dumps(value), encoding="utf-8")
+                self.assertIs(load_config(root, allow_blank_secrets=True).semantic_compliance_enabled, expected)
+
+    def test_semantic_mode_is_frozen_on_claim(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            settings = root / "config.json"
+            settings.write_text('{"semanticComplianceEnabled":true}', encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("测试正文。", encoding="utf-8")
+            claimed = rewrite_processor.claim_source(source, config)
+            settings.write_text('{"semanticComplianceEnabled":false}', encoding="utf-8")
+            self.assertTrue(rewrite_processor.semantic_mode_for_job(claimed, config))
+            legacy = claimed.parent.parent / "legacy" / "legacy.txt"
+            legacy.parent.mkdir()
+            legacy.write_text("旧任务。", encoding="utf-8")
+            self.assertFalse(rewrite_processor.semantic_mode_for_job(legacy, config))
+
+    def test_save_rewrite_persists_semantic_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source_var = SimpleNamespace(get=lambda: str(source), set=lambda value: None)
+            value = lambda text: SimpleNamespace(get=lambda: text)
+            fake = SimpleNamespace(
+                max_request_chars=value("8000"), request_timeout_seconds=value("300"),
+                source_dir=source_var, rewrite_key=value("fake"), rewrite_url=value("https://example.test"),
+                webhook=value("fake"), model=value("test-model"),
+                semantic_compliance_enabled=value(True), read_json=lambda path: {}, log=lambda message: None,
+            )
+            with patch.object(unified_app, "REWRITE_DIR", root):
+                self.assertTrue(unified_app.App.save_rewrite(fake))
+            self.assertIs(json.loads((root / "config.json").read_text(encoding="utf-8"))["semanticComplianceEnabled"], True)
+
+    @staticmethod
+    def semantic_response(content, finish_reason="stop"):
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}]},
+        )
+
+    def test_semantic_audit_rejects_unknown_category_and_duplicate_keys(self):
+        arguments = dict(api_key="fake", model="test", url="https://example.test/chat/completions",
+                         original="甲走进房间。", current="甲走进房间。", extra_rules="",
+                         max_chars=1000, timeout=30, checkpoint_dir=None)
+        bad_contents = (
+            '{"risks":[{"id":"0","category":"unknown","reason":"风险"}]}',
+            '{"risks":[],"risks":[]}',
+            '{"risks":[{"id":"9","category":"violence","reason":"风险"}]}',
+            '{"risks":[{"id":"0","category":[],"reason":"风险"}]}',
+        )
+        for content in bad_contents:
+            with self.subTest(content=content), patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(content)):
+                with self.assertRaises(semantic_compliance.SemanticProtocolError) as error:
+                    semantic_compliance.audit_text(**arguments)
+                self.assertNotIn(content, str(error.exception))
+
+    def test_semantic_audit_uses_provider_protocol(self):
+        for url, expected_field in (("https://api.deepseek.com/chat/completions", "thinking"),
+                                    ("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "enable_thinking")):
+            calls = []
+            def post(actual_url, *, headers, json, timeout):
+                calls.append((actual_url, headers, json, timeout))
+                return self.semantic_response('{"risks":[{"id":"0","category":"violence","reason":"有风险"}]}')
+            with self.subTest(url=url), patch.object(semantic_compliance.requests, "post", side_effect=post):
+                result = semantic_compliance.audit_text(
+                    api_key="fake", model="test-model", url=url, original="甲走进房间。",
+                    current="甲走进房间。", extra_rules="", max_chars=1000,
+                    timeout=30, checkpoint_dir=None,
+                )
+                self.assertEqual(result, (semantic_compliance.Risk("0", "violence"),))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][0], url)
+                self.assertEqual(calls[0][2]["model"], "test-model")
+                self.assertEqual(calls[0][3], 30)
+                self.assertEqual(calls[0][1]["Authorization"], "Bearer fake")
+                self.assertIn(expected_field, calls[0][2])
+                prompt = calls[0][2]["messages"][0]["content"]
+                for category in semantic_compliance.CATEGORIES - {"fidelity"}:
+                    self.assertIn(category, prompt)
+                self.assertNotIn("fidelity", prompt)
+                if expected_field == "thinking":
+                    self.assertEqual(calls[0][2]["thinking"], {"type": "disabled"})
+                else:
+                    self.assertIs(calls[0][2]["enable_thinking"], False)
+                    self.assertEqual(calls[0][2]["response_format"], {"type": "json_object"})
+
+    def test_semantic_audit_sends_context_at_batch_boundaries(self):
+        original = "甲" * 160 + "旧高跟鞋。\n" + "乙" * 160 + "她遭到取笑。\n" + "取消订婚。" + "丙" * 160 + "\n"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            requests_seen.append(payload)
+            return self.semantic_response('{"risks":[]}')
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=450,
+                timeout=30, checkpoint_dir=None,
+            )
+        middle = next(payload for payload in requests_seen if any(row["id"] == "1" for row in payload["paragraphs"]))
+        self.assertIn("旧高跟鞋", middle["context_before"])
+        self.assertIn("取消订婚", middle["context_after"])
+        self.assertEqual([row["id"] for row in middle["paragraphs"]], ["1"])
+
+    def test_semantic_rewrite_sends_context_for_ambiguous_slur_and_object(self):
+        original = "桌上是一只破旧高跟鞋。\n他说：‘你这只破鞋。’\n她拒绝喝酒。\n"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            requests_seen.extend(payload["paragraphs"])
+            return self.semantic_response('{"1":"他说：‘你这只破鞋。’"}')
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("1", "abuse", "辱骂", "破鞋"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        target = requests_seen[0]
+        self.assertIn("高跟鞋", target["context_before"])
+        self.assertIn("拒绝喝酒", target["context_after"])
+
+    def test_semantic_rewrite_can_see_object_introduced_four_lines_earlier(self):
+        original = "她拿出一只高跟鞋。\n众人笑了。\n他说出了秘密。\n她没说话。\n他说：‘比起这只破鞋，你更脏。’\n"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            requests_seen.extend(payload["paragraphs"])
+            return self.semantic_response('{"4":"他说：‘比起这只旧鞋，你更脏。’"}')
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("4", "abuse", "辱骂", "破鞋"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertIn("高跟鞋", requests_seen[0]["context_before"])
+
+    def test_semantic_reason_reaches_targeted_rewrite_and_survives_checkpoint(self):
+        original = "危险描写。\n保留句子。\n"
+        rewrite_requests = []
+        def post(_url, *, headers, json, timeout):
+            prompt = json["messages"][0]["content"]
+            if "风险复核员" in prompt:
+                return self.semantic_response('{"risks":[{"id":"0","category":"violence","reason":"含具体暴力描写"}]}')
+            rewrite_requests.append(json)
+            return self.semantic_response('{"0":"克制描写。"}')
+        with tempfile.TemporaryDirectory() as temporary, patch.object(semantic_compliance.requests, "post", side_effect=post):
+            arguments = dict(api_key="fake", model="test", url="https://example.test/chat/completions",
+                             original=original, current=original, extra_rules="", max_chars=1000,
+                             timeout=30, checkpoint_dir=Path(temporary) / "audit")
+            risks = semantic_compliance.audit_text(**arguments)
+            self.assertEqual(getattr(risks[0], "reason", None), "含具体暴力描写")
+            rewritten = semantic_compliance.rewrite_flagged(
+                **{key: value for key, value in arguments.items() if key != "checkpoint_dir"},
+                risks=risks, checkpoint_dir=None,
+            )
+            self.assertEqual(rewritten, "克制描写。\n保留句子。\n")
+            request = json.loads(rewrite_requests[0]["messages"][1]["content"])
+            self.assertEqual(request["paragraphs"][0]["risk_reasons"],
+                             [{"category": "violence", "reason": "含具体暴力描写"}])
+            with patch.object(semantic_compliance.requests, "post", side_effect=AssertionError("cache should be reused")):
+                restored = semantic_compliance.audit_text(**arguments)
+            self.assertEqual(restored[0].reason, "含具体暴力描写")
+
+    def test_exact_risk_span_is_passed_to_targeted_rewrite_and_cached(self):
+        original = "他骂了一句晦气，随后离开。\n普通叙述。\n"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            prompt = json["messages"][0]["content"]
+            if "风险复核员" in prompt:
+                return self.semantic_response(
+                    '{"risks":[{"id":"0","category":"abuse","reason":"不文明用语","span":"晦气"}]}'
+                )
+            requests_seen.append(json)
+            return self.semantic_response('{"0":"他骂了一句不吉利，随后离开。"}')
+        with tempfile.TemporaryDirectory() as temporary, patch.object(semantic_compliance.requests, "post", side_effect=post):
+            arguments = dict(api_key="fake", model="test", url="https://example.test/chat/completions",
+                             original=original, current=original, extra_rules="", max_chars=1000,
+                             timeout=30, checkpoint_dir=Path(temporary))
+            risks = semantic_compliance.audit_text(**arguments)
+            self.assertEqual(risks[0].span, "晦气")
+            rewritten = semantic_compliance.rewrite_flagged(**{**arguments, "risks": risks, "checkpoint_dir": None})
+            self.assertEqual(rewritten, "他骂了一句不吉利，随后离开。\n普通叙述。\n")
+            payload = json.loads(requests_seen[0]["messages"][1]["content"])
+            self.assertEqual(payload["paragraphs"][0]["risk_spans"], [{"category": "abuse", "span": "晦气"}])
+            with patch.object(semantic_compliance.requests, "post", side_effect=AssertionError("cache must be reused")):
+                restored = semantic_compliance.audit_text(**arguments)
+            self.assertEqual(restored[0].span, "晦气")
+
+    def test_unmatched_risk_span_does_not_create_false_target(self):
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"risks":[{"id":"0","category":"abuse","reason":"不文明用语","span":"原文不存在的词"}]}'
+        )):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original="他说晦气。", current="他说晦气。", extra_rules="", max_chars=1000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks[0].span, "")
+
+    def test_missing_span_uses_exact_quoted_term_from_reason(self):
+        original = "她说：‘破鞋配破鞋。’"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"risks":[{"id":"0","category":"abuse","reason":"使用‘破鞋’侮辱对方","span":""}]}'
+        )):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=1000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks[0].span, "破鞋")
+
+    def test_known_expression_is_targeted_when_model_audit_misses_it(self):
+        original = "她抱怨：‘真晦气。’"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            requests_seen.append(json)
+            return self.semantic_response('{"0":"她抱怨：‘真不吉利。’"}')
+        with patch.object(semantic_compliance, "audit_text", return_value=()), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+             patch.object(semantic_compliance.requests, "post", side_effect=post):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "她抱怨：‘真不吉利。’")
+        payload = json.loads(requests_seen[0]["messages"][1]["content"])
+        self.assertEqual(payload["paragraphs"][0]["risk_spans"], [{"category": "abuse", "span": "晦气"}])
+
+    def test_known_expression_fills_missing_span_in_model_risk(self):
+        original = "她说：‘真晦气。’"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            requests_seen.append(json)
+            return self.semantic_response('{"0":"她说：‘真不吉利。’"}')
+        with patch.object(semantic_compliance, "audit_text", return_value=(
+                 semantic_compliance.Risk("0", "abuse", "不文明评价"),
+             )), patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+             patch.object(semantic_compliance.requests, "post", side_effect=post):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "她说：‘真不吉利。’")
+        payload = json.loads(requests_seen[0]["messages"][1]["content"])
+        self.assertEqual(payload["paragraphs"][0]["risk_spans"], [{"category": "abuse", "span": "晦气"}])
+
+    def test_known_literal_expression_is_editable_even_if_model_marks_story(self):
+        original = "她骂我是小三。"
+        risks = (semantic_compliance.Risk("0", "abuse", "污名化称呼", "小三", "story"),)
+        supplemented = semantic_compliance._supplement_expression_risks(original, original, risks)
+        self.assertEqual(supplemented[0].handling, "wording")
+        self.assertEqual(supplemented[0].span, "小三")
+
+    def test_automatic_literal_rescue_keeps_safe_wording_after_ai_fact_fallback(self):
+        original = "她骂我是小三。"
+        prior = semantic_compliance.SemanticResult(
+            original, (semantic_compliance.Risk("0", "fidelity"),), 1, 2, "fidelity_fallback"
+        )
+        final_risks = (semantic_compliance.Risk("0", "abuse", "人物仍在指责", "第三者", "story"),)
+        rescue = getattr(semantic_compliance, "automatic_review_and_rewrite", None)
+        self.assertTrue(callable(rescue))
+        with patch.object(semantic_compliance, "review_and_rewrite", return_value=prior), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()) as facts, \
+             patch.object(semantic_compliance, "audit_text", return_value=final_risks) as audit, \
+             patch.object(semantic_compliance, "verify_risk_evidence", return_value=final_risks):
+            result = rescue(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(),
+                replacements={}, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "她骂我是第三者。")
+        self.assertEqual(result.review_status, "fidelity_repaired")
+        self.assertEqual(result.remaining_risks, final_risks)
+        self.assertEqual(facts.call_count, 1)
+        self.assertEqual(audit.call_count, 1)
+
+    def test_automatic_fallback_does_not_report_rejected_candidate_as_current_drift(self):
+        original = "他碰到我的腰带。"
+        prior = semantic_compliance.SemanticResult(
+            original,
+            (semantic_compliance.Risk("0", "sexual", "情节风险", "腰带", "story"),
+             semantic_compliance.Risk("0", "fidelity", "候选稿事实漂移，已恢复原文")),
+            2, 1, "fidelity_fallback",
+        )
+        with patch.object(semantic_compliance, "review_and_rewrite", return_value=prior), \
+             patch.object(semantic_compliance, "verify_risk_evidence", return_value=(prior.remaining_risks[0],)):
+            result = semantic_compliance.automatic_review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(),
+                replacements={}, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+        self.assertEqual([risk.category for risk in result.remaining_risks], ["sexual"])
+
+    def test_independent_evidence_review_separates_benign_and_supported_flags(self):
+        original = "她坐在私人沙发里。\n他骂她是个废物。"
+        risks = (
+            semantic_compliance.Risk("0", "abuse", "沙发暗示不文明", "私人沙发", "wording"),
+            semantic_compliance.Risk("1", "abuse", "直接侮辱", "废物", "wording"),
+        )
+        verdicts = {"verdicts": [
+            {"id": "0:abuse", "verdict": "unsupported", "evidence": "只是家具事实"},
+            {"id": "1:abuse", "verdict": "supported_wording", "evidence": "废物"},
+        ]}
+        review = getattr(semantic_compliance, "verify_risk_evidence", None)
+        self.assertTrue(callable(review))
+        with patch.object(semantic_compliance, "_request_json", return_value=verdicts):
+            result = review(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, risks=risks,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.handling for risk in result], ["unsupported", "wording"])
+        self.assertEqual([risk.evidence_status for risk in result], ["unsupported", "supported"])
+        self.assertEqual(result[1].evidence, "废物")
+
+    def test_independent_evidence_review_requires_literal_support_quote(self):
+        original = "他骂她是个废物。\n她称他是混蛋。"
+        risk = semantic_compliance.Risk("0", "abuse", "直接侮辱", "废物", "wording")
+        second = semantic_compliance.Risk("1", "abuse", "直接侮辱", "混蛋", "wording")
+        review = getattr(semantic_compliance, "verify_risk_evidence", None)
+        self.assertTrue(callable(review))
+        with patch.object(semantic_compliance, "_request_json", return_value={"verdicts": [
+            {"id": "0:abuse", "verdict": "supported_wording", "evidence": "破鞋"},
+            {"id": "1:abuse", "verdict": "supported_wording", "evidence": "混蛋"},
+        ]}):
+            result = review(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, risks=(risk, second),
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([item.evidence_status for item in result], ["uncertain", "supported"])
+        self.assertEqual(result[0].evidence, "引用无法在当前段落核对")
+
+    def test_evidence_service_failure_keeps_text_pending_for_automatic_retry(self):
+        original = "他骂她是个废物。"
+        risk = semantic_compliance.Risk("0", "abuse", "直接侮辱", "废物", "wording")
+        prior = semantic_compliance.SemanticResult(original, (risk,), 1, 0)
+        with patch.object(semantic_compliance, "verify_risk_evidence",
+                          side_effect=semantic_compliance.SemanticTransientError("temporary")):
+            result = semantic_compliance._rescue_supported_wording(
+                prior=prior, api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "evidence_unverified")
+        self.assertFalse(rewrite_processor._automatic_review_complete(result.review_status))
+
+    def test_rescue_service_failure_keeps_verified_text_pending_for_retry(self):
+        original = "他骂她是个废物。"
+        risk = semantic_compliance.Risk("0", "abuse", "直接侮辱", "废物", "wording",
+                                        evidence_status="supported", evidence="废物")
+        prior = semantic_compliance.SemanticResult(original, (risk,), 1, 0)
+        with patch.object(semantic_compliance, "verify_risk_evidence", return_value=(risk,)), \
+             patch.object(semantic_compliance, "rewrite_flagged",
+                          side_effect=semantic_compliance.SemanticTransientError("temporary")):
+            result = semantic_compliance._rescue_supported_wording(
+                prior=prior, api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "rescue_unverified")
+        self.assertFalse(rewrite_processor._automatic_review_complete(result.review_status))
+
+    def test_risk_summary_does_not_call_every_model_flag_confirmed(self):
+        risks = (
+            semantic_compliance.Risk("0", "abuse", handling="wording", evidence_status="supported"),
+            semantic_compliance.Risk("1", "violence", handling="story", evidence_status="supported"),
+            semantic_compliance.Risk("2", "abuse", handling="unsupported", evidence_status="unsupported"),
+            semantic_compliance.Risk("3", "sexual", handling="uncertain", evidence_status="uncertain"),
+            semantic_compliance.Risk("4", "abuse", handling="wording"),
+        )
+        summary = getattr(semantic_compliance, "summarize_risks", None)
+        self.assertTrue(callable(summary))
+        self.assertEqual(summary(risks), {
+            "model_flags": 5, "supported_wording": 1, "supported_story": 1,
+            "suspected_false_positive": 1, "uncertain": 1, "evidence_unverified": 1,
+        })
+
+    def test_automatic_rescue_accepts_supported_fact_safe_local_rewrite(self):
+        original = "她说你真没用。"
+        candidate = "她说你做得不够好。"
+        risk = semantic_compliance.Risk("0", "abuse", "直接贬低", "你真没用", "wording")
+        prior = semantic_compliance.SemanticResult(original, (risk,), 1, 2, "fidelity_fallback")
+        supported = replace(risk, evidence_status="supported", evidence="你真没用")
+        with patch.object(semantic_compliance, "review_and_rewrite", return_value=prior), \
+             patch.object(semantic_compliance, "verify_risk_evidence", side_effect=[(supported,), ()]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate) as rewrite, \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+             patch.object(semantic_compliance, "audit_text", return_value=()):
+            result = semantic_compliance.automatic_review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(),
+                replacements={}, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, candidate)
+        self.assertEqual(result.review_status, "fidelity_repaired")
+        self.assertEqual(result.remaining_risks, ())
+
+    def test_automatic_rescue_rejects_same_supported_wording_risk(self):
+        original = "她说你真没用。"
+        candidate = "她说你做得不够好。"
+        before = replace(semantic_compliance.Risk("0", "abuse", "直接贬低", "你真没用"),
+                         evidence_status="supported", evidence="你真没用")
+        after = replace(semantic_compliance.Risk("0", "abuse", "仍有贬低", "你做得不够好"),
+                        evidence_status="supported", evidence="你做得不够好")
+        prior = semantic_compliance.SemanticResult(original, (before,), 1, 2, "fidelity_fallback")
+        with patch.object(semantic_compliance, "review_and_rewrite", return_value=prior), \
+             patch.object(semantic_compliance, "verify_risk_evidence", side_effect=[(before,), (after,)]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate) as rewrite, \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+             patch.object(semantic_compliance, "audit_text", return_value=(after,)):
+            result = semantic_compliance.automatic_review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(),
+                replacements={}, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.remaining_risks, (before,))
+        self.assertEqual(rewrite.call_count, 1)
+
+    def test_automatic_rescue_rejects_same_category_when_reviewer_calls_it_story(self):
+        original = "他撕开了我的衣领。"
+        before = semantic_compliance.Risk("0", "sexual", "强迫行为", "撕开了我的衣领", "wording",
+                                          evidence_status="supported", evidence="撕开了我的衣领")
+        after = semantic_compliance.Risk("0", "sexual", "强迫行为", "粗暴扯开我的衣领", "story",
+                                         evidence_status="supported", evidence="粗暴扯开我的衣领")
+        prior = semantic_compliance.SemanticResult(original, (before,), 0, 0)
+        with patch.object(semantic_compliance, "verify_risk_evidence", side_effect=[(before,), (after,)]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value="他粗暴扯开我的衣领。"), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+             patch.object(semantic_compliance, "audit_text", return_value=(after,)):
+            result = semantic_compliance._rescue_supported_wording(
+                prior=prior, api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.remaining_risks, (before,))
+
+    def test_automatic_rescue_rejects_fact_drift(self):
+        original = "她说你真没用。"
+        candidate = "他说你做得不够好。"
+        risk = replace(semantic_compliance.Risk("0", "abuse", "直接贬低", "你真没用"),
+                       evidence_status="supported", evidence="你真没用")
+        prior = semantic_compliance.SemanticResult(original, (risk,), 1, 2, "fidelity_fallback")
+        with patch.object(semantic_compliance, "review_and_rewrite", return_value=prior), \
+             patch.object(semantic_compliance, "verify_risk_evidence", return_value=(risk,)), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate) as rewrite, \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=(
+                 semantic_compliance.Risk("0", "fidelity"),
+             )) as facts:
+            result = semantic_compliance.automatic_review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", banned_terms=(),
+                replacements={}, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(rewrite.call_count, 1)
+        self.assertEqual(facts.call_count, 1)
+
+    def test_residual_wording_attempts_each_risk_and_records_decisions(self):
+        original = "她说穷人不配被尊重。\n他让人替他考试。"
+        first = "她说不该轻视穷人。\n他让人替他考试。"
+        unsafe = "她说不该轻视穷人。\n他请人帮忙考试。"
+        risks = (
+            semantic_compliance.Risk("0", "harmful_values", "歧视言论", "穷人不配被尊重",
+                                     evidence_status="supported", evidence="穷人不配被尊重"),
+            semantic_compliance.Risk("1", "illegal", "代考", "替他考试",
+                                     evidence_status="supported", evidence="替他考试"),
+        )
+        prior = semantic_compliance.SemanticResult(original, risks, 0, 0)
+        with patch.object(semantic_compliance, "verify_risk_evidence", side_effect=[risks, ()]), \
+             patch.object(semantic_compliance, "rewrite_flagged", side_effect=[first, unsafe]) as rewrite, \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[(), (
+                 semantic_compliance.Risk("1", "fidelity"),
+             )]), \
+             patch.object(semantic_compliance, "audit_text", return_value=()):
+            result = semantic_compliance._rescue_supported_wording(
+                prior=prior, api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(rewrite.call_count, 2)
+        self.assertEqual(result.text, first)
+        self.assertEqual([item["outcome"] for item in result.risk_actions], ["accepted", "fact_drift"])
+        self.assertEqual([risk.id for risk in result.remaining_risks], ["1"])
+
+    def test_residual_review_records_why_flags_were_not_rewritten(self):
+        original = "她坐在私人沙发上。\n他明确说要离婚。\n这句话含义不明。\n她说话伤人。"
+        risks = (
+            semantic_compliance.Risk("0", "abuse", "家具", "私人沙发", "unsupported", "unsupported", "家具事实"),
+            semantic_compliance.Risk("1", "harmful_values", "离婚情节", "要离婚", "story", "supported", "要离婚"),
+            semantic_compliance.Risk("2", "abuse", "语义不明", "含义不明", "uncertain", "uncertain", "需上下文"),
+            semantic_compliance.Risk("3", "abuse", "措辞风险", "", "wording", "supported", "说话伤人"),
+        )
+        prior = semantic_compliance.SemanticResult(original, risks, 0, 0)
+        with patch.object(semantic_compliance, "verify_risk_evidence", return_value=risks), \
+             patch.object(semantic_compliance, "rewrite_flagged") as rewrite:
+            result = semantic_compliance._rescue_supported_wording(
+                prior=prior, api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        rewrite.assert_not_called()
+        self.assertEqual([item["outcome"] for item in result.risk_actions],
+                         ["suspected_false_positive", "story", "uncertain", "span_not_located"])
+
+    def test_residual_rewrite_rejects_loss_of_sexual_shaming_meaning(self):
+        cases = (
+            ("原来我在他眼里一直以来就是只破鞋。", "原来我在他眼里一直以来就是这么不堪。", "破鞋"),
+            ("难不成还真把自己当黄花大闺女了？", "难不成还真把自己当千金小姐了？", "黄花大闺女"),
+            ("你干净不到哪里去。我都没嫌弃。", "你也没好到哪儿去。我都没计较。", "干净不到哪里去"),
+            ("医院里冻着的那个胚胎，明天取消。", "医院里存着的那个胚胎，明天取消。", "冻着的那个胚胎"),
+        )
+        for original, candidate, span in cases:
+            with self.subTest(span=span):
+                risk = semantic_compliance.Risk("0", "abuse", "贬损评价", span,
+                                                evidence_status="supported", evidence=span)
+                prior = semantic_compliance.SemanticResult(original, (risk,), 0, 0)
+                with patch.object(semantic_compliance, "verify_risk_evidence", side_effect=[(risk,), ()]), \
+                     patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+                     patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+                     patch.object(semantic_compliance, "audit_text", return_value=()):
+                    result = semantic_compliance._rescue_supported_wording(
+                        prior=prior, api_key="fake", model="test", url="https://example.test/chat/completions",
+                        original=original, extra_rules="", banned_terms=(), replacements={},
+                        max_chars=1000, timeout=30, checkpoint_dir=None,
+                    )
+                self.assertEqual(result.text, original)
+                self.assertEqual(result.risk_actions[0]["outcome"], "meaning_drift")
+
+    def test_local_rescue_content_audits_only_edited_paragraph(self):
+        original = "第一段安全。\n第二段他骂人。"
+        seen = []
+        def request(**kwargs):
+            seen.append([entry["id"] for entry in kwargs["payload"]["paragraphs"]])
+            return {"risks": []}
+        with patch.object(semantic_compliance, "_request_json", side_effect=request):
+            result = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=1000,
+                timeout=30, checkpoint_dir=None, target_ids={"1"},
+            )
+        self.assertEqual(result, ())
+        self.assertTrue(seen)
+        self.assertTrue(all(ids == ["1"] for ids in seen))
+
+    def test_local_rescue_fact_audits_only_edited_paragraph(self):
+        original = "第一段安全。\n第二段他骂人。"
+        current = "第一段变化。\n第二段他指责人。"
+        seen = []
+        def request(**kwargs):
+            ids = [entry["id"] for entry in kwargs["payload"]["paragraphs"]]
+            seen.append(ids)
+            return {"verdicts": [{"id": identifier, "verdict": "tone_only"} for identifier in ids]}
+        with patch.object(semantic_compliance, "_request_json", side_effect=request):
+            result = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=1000,
+                timeout=30, checkpoint_dir=None, target_ids={"1"},
+            )
+        self.assertEqual(result, ())
+        self.assertEqual(seen, [["1"]])
+
+    def test_known_expression_rewrite_is_isolated_from_other_risk_paragraphs(self):
+        original = "她说真晦气。\n有人受伤。\n"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            requests_seen.append(payload)
+            return self.semantic_response(__import__("json").dumps({
+                row["id"]: "她说真不吉利。" if row["id"] == "0" else "有人受伤。"
+                for row in payload["paragraphs"]
+            }, ensure_ascii=False))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "措辞风险", "晦气"),
+                       semantic_compliance.Risk("1", "violence", "行为风险", "受伤")),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, "她说真不吉利。\n有人受伤。\n")
+        self.assertEqual([[row["id"] for row in payload["paragraphs"]] for payload in requests_seen],
+                         [["0"], ["1"]])
+
+    def test_known_expression_keeps_only_local_edit_from_overbroad_ai_candidate(self):
+        original = "她说：‘真晦气，听说病人快死了。’"
+        ai_reply = '{"0":"她说：‘真不吉利，听说病人不舒服。’"}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(ai_reply)):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "不文明用语", "晦气"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, "她说：‘真不吉利，听说病人快死了。’")
+
+    def test_value_risk_keeps_same_sentence_framing_but_not_later_action_change(self):
+        original = "他当众说穷人不配被尊重，还说自己只认有钱人。她把门关上。"
+        reply = json.dumps({"0": "他当众说穷人不配被尊重，还说自己只认有钱人，这番话透着偏见。她跑走了。"}, ensure_ascii=False)
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "harmful_values", "以财富衡量人的价值", "穷人不配被尊重"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, "他当众说穷人不配被尊重，还说自己只认有钱人，这番话透着偏见。她把门关上。")
+
+    def test_known_expression_uses_exact_safe_swap_when_ai_returns_original(self):
+        original = "她说晦气，也说不吉利。"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"0":"她说晦气，也说不吉利。"}'
+        )):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "不文明用语", "晦气"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, "她说不吉利，也说不吉利。")
+
+    def test_direct_mental_health_insult_is_softened_without_changing_divorce_claim(self):
+        original = "“什么？林挽月，你有病吧！你一回来就闹离婚。”"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            json.dumps({"0": original}, ensure_ascii=False)
+        )):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "以疾病词语辱骂", "你有病吧"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, "“什么？林挽月，你太过分了吧！你一回来就闹离婚。”")
+
+    def test_many_short_risk_paragraphs_are_rewritten_in_small_batches(self):
+        original = "".join(f"风险句{i}。\n" for i in range(18))
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            requests_seen.append(payload)
+            return self.semantic_response(__import__("json").dumps({
+                row["id"]: row["current"] for row in payload["paragraphs"]
+            }, ensure_ascii=False))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=tuple(semantic_compliance.Risk(str(i), "violence") for i in range(18)),
+                extra_rules="", max_chars=8000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, original)
+        self.assertEqual([len(payload["paragraphs"]) for payload in requests_seen], [8, 8, 2])
+
+    def test_semantic_reason_is_bounded_and_private_in_repr(self):
+        long_reason = "具体暴力细节" * 100
+        response = json.dumps({"risks": [{"id": "0", "category": "violence", "reason": long_reason}]}, ensure_ascii=False)
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            semantic_compliance.requests, "post", return_value=self.semantic_response(response)
+        ):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original="危险句。", current="危险句。", extra_rules="", max_chars=1000,
+                timeout=30, checkpoint_dir=Path(temporary),
+            )
+            reason = getattr(risks[0], "reason", "")
+            self.assertTrue(reason)
+            self.assertLessEqual(len(reason), 160)
+            self.assertNotIn("具体暴力细节", repr(risks[0]))
+            cached = (Path(temporary) / "0001.json").read_text(encoding="utf-8")
+            self.assertNotIn(long_reason, cached)
+
+    def test_semantic_cached_risk_without_reason_is_reaudited(self):
+        arguments = dict(api_key="fake", model="test", url="https://example.test/chat/completions",
+                         original="危险句。", current="危险句。", extra_rules="", max_chars=1000,
+                         timeout=30)
+        with tempfile.TemporaryDirectory() as temporary:
+            arguments["checkpoint_dir"] = Path(temporary)
+            with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+                '{"risks":[{"id":"0","category":"violence","reason":"首次原因"}]}'
+            )):
+                semantic_compliance.audit_text(**arguments)
+            cache = Path(temporary) / "0001.json"
+            value = json.loads(cache.read_text(encoding="utf-8"))
+            value["value"][0].pop("reason", None)
+            cache.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+            with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+                '{"risks":[{"id":"0","category":"violence","reason":"重新复核原因"}]}'
+            )) as post:
+                risks = semantic_compliance.audit_text(**arguments)
+            post.assert_called_once()
+            self.assertEqual(risks[0].reason, "重新复核原因")
+
+    def test_revised_audit_ignores_checkpoint_from_old_prompt(self):
+        original = "“一只铃铛而已，你藏三年不嫌晦气？”"
+        with tempfile.TemporaryDirectory() as temporary:
+            payload = {"rules": "", "paragraphs": [{
+                "id": "0", "original": original, "current": "“一只铃铛而已，你藏三年不嫌不吉利？”",
+            }]}
+            old_signature = semantic_compliance._cache_signature(
+                "audit", payload, "https://example.test/chat/completions", "test"
+            )
+            (Path(temporary) / "0001.json").write_text(json.dumps({
+                "version": 1, "signature": old_signature,
+                "value": [{"id": "0", "category": "fidelity", "reason": "旧模型误报"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response('{"risks":[]}')) as post:
+                risks = semantic_compliance.audit_text(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original=original, current=payload["paragraphs"][0]["current"],
+                    extra_rules="", max_chars=1000, timeout=30,
+                    checkpoint_dir=Path(temporary),
+                )
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(risks, ())
+
+    def test_semantic_reason_does_not_make_fitting_paragraph_oversized(self):
+        original = "危险句。" * 20
+        replacement = "平静句。" * 20
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            requests_seen.append(__import__("json").loads(json["messages"][1]["content"]))
+            return self.semantic_response(__import__("json").dumps({"0": replacement}, ensure_ascii=False))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "violence", "具体暴力描写" * 20),),
+                extra_rules="", max_chars=300, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, replacement)
+        self.assertLessEqual(len(json.dumps(requests_seen[0], ensure_ascii=False, separators=(",", ":"))), 300)
+
+    def test_semantic_audit_preserves_global_ids_across_batches(self):
+        original = ("同一句文字。" * 5) + "\r\n\r\n" + ("同一句文字。" * 5) + "\r\n"
+        payloads = []
+        def post(_url, *, headers, json, timeout):
+            batch = __import__("json").loads(json["messages"][1]["content"])
+            payloads.append(batch)
+            risk_id = batch["paragraphs"][0]["id"]
+            return self.semantic_response(__import__("json").dumps({"risks": [{"id": risk_id, "category": "violence", "reason": "风险"}]}))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=100,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "violence"), semantic_compliance.Risk("1", "violence")))
+        self.assertEqual(len(payloads), 2)
+
+    def test_semantic_content_audit_caps_large_configured_batches(self):
+        original = "\n".join("甲" * 35 for _ in range(100))
+        payloads = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            payloads.append(payload)
+            return self.semantic_response(__import__("json").dumps({"risks": [{
+                "id": payload["paragraphs"][0]["id"], "category": "violence", "reason": "测试风险",
+            }]}))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=8000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertGreater(len(payloads), 1)
+        self.assertEqual(len(risks), len(payloads))
+        self.assertTrue(all(len(__import__("json").dumps(payload, ensure_ascii=False,
+                                                        separators=(",", ":"))) <= 4000 for payload in payloads))
+
+    def test_semantic_content_audit_sends_single_long_paragraph_within_configured_budget(self):
+        original = "甲" * 2000
+        response = '{"risks":[{"id":"0","category":"violence","reason":"测试风险"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(response)) as post:
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=8000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "violence"),))
+        post.assert_called_once()
+
+    def test_semantic_audit_rejects_oversized_single_paragraph(self):
+        with patch.object(semantic_compliance.requests, "post") as post:
+            with self.assertRaises(semantic_compliance.SemanticProtocolError):
+                semantic_compliance.audit_text(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original="甲" * 100, current="甲" * 100, extra_rules="",
+                    max_chars=30, timeout=30, checkpoint_dir=None,
+                )
+        post.assert_not_called()
+
+    def test_semantic_audit_discards_impossible_fidelity_on_unchanged_source(self):
+        original = "她未经同意被结扎。"
+        response = '{"risks":[{"id":"0","category":"fidelity","reason":"情节变化"},{"id":"0","category":"violence","reason":"场景风险"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(response)):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=1000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "violence"),))
+
+    def test_changed_paragraph_content_audit_ignores_fidelity_only_reply(self):
+        payloads = []
+        replies = iter([
+            '{"risks":[{"id":"0","category":"fidelity","reason":"内容复核误判剧情"}]}',
+            '{"risks":[{"id":"0","category":"violence","reason":"仍有危险情节"}]}',
+        ])
+        def post(_url, *, headers, json, timeout):
+            payloads.append(__import__("json").loads(json["messages"][1]["content"]))
+            return self.semantic_response(next(replies))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original="她受到伤害。", current="她曾受到伤害。", extra_rules="",
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "violence"),))
+        self.assertEqual(payloads, [
+            {"rules": "", "paragraphs": [{"id": "0", "current": "她曾受到伤害。"}]},
+            {"rules": "", "paragraphs": [{"id": "0", "current": "她曾受到伤害。"}]},
+        ])
+
+    def test_semantic_audit_rejects_nonterminal_model_response(self):
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response('{"risks":[]}', finish_reason="content_filter")):
+            with self.assertRaises(semantic_compliance.SemanticProtocolError):
+                semantic_compliance.audit_text(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original="甲走进房间。", current="甲走进房间。", extra_rules="",
+                    max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+
+    def test_semantic_network_errors_remain_transient(self):
+        arguments = dict(api_key="fake", model="test", url="https://example.test/chat/completions",
+                         original="甲走进房间。", current="甲走进房间。", extra_rules="",
+                         max_chars=1000, timeout=30, checkpoint_dir=None)
+        for error in (requests.Timeout("secret"), requests.ConnectionError("secret"),
+                      requests.HTTPError("secret", response=SimpleNamespace(status_code=429))):
+            with self.subTest(error=type(error).__name__), patch.object(semantic_compliance.requests, "post", side_effect=error):
+                with self.assertRaises(semantic_compliance.SemanticTransientError) as caught:
+                    semantic_compliance.audit_text(**arguments)
+                self.assertTrue(is_transient_error(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+
+    def test_semantic_rewrite_preserves_unflagged_lines_and_crlf(self):
+        original = "危险句。\r\n\r\n保留句。\r\n"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response('{"0":"平静句。"}')):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "violence"),), extra_rules="",
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, "平静句。\r\n\r\n保留句。\r\n")
+
+    def test_revised_rewrite_ignores_checkpoint_from_old_prompt(self):
+        original = "她未经同意被结扎。"
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            payload = {"rules": "", "paragraphs": [{
+                "id": "0", "original": original, "current": original,
+                "categories": ["violence"],
+            }]}
+            old_signature = semantic_compliance._cache_signature(
+                "rewrite", payload, "https://example.test/chat/completions", "test"
+            )
+            (cache_dir / "0001.json").write_text(json.dumps({
+                "version": 1, "signature": old_signature, "value": {"0": "她做了手术。"},
+            }, ensure_ascii=False), encoding="utf-8")
+            with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+                '{"0":"她未经同意被结扎。"}'
+            )) as post:
+                result = semantic_compliance.rewrite_flagged(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original=original, current=original,
+                    risks=(semantic_compliance.Risk("0", "violence"),),
+                    extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=cache_dir,
+                )
+            post.assert_called_once()
+            self.assertEqual(result, original)
+            prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+            self.assertIn("手术", prompt)
+            self.assertIn("死亡", prompt)
+
+    def test_semantic_review_stops_when_clean(self):
+        with patch.object(semantic_compliance, "audit_text", return_value=()) as audit, \
+             patch.object(semantic_compliance, "rewrite_flagged") as rewrite:
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="平静文字。",
+                current="平静文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "平静文字。")
+        self.assertEqual(result.remaining_risks, ())
+        self.assertEqual(audit.call_count, 1)
+        rewrite.assert_not_called()
+
+    def test_audit_handling_is_validated_and_kept(self):
+        risk = semantic_compliance._audit_risks({"risks": [{
+            "id": "0", "category": "abuse", "reason": "辱骂称谓",
+            "span": "贱人", "handling": "story",
+        }]}, {"0"}, current_by_id={"0": "她叫他贱人。"})[0]
+        self.assertEqual(risk.handling, "story")
+        with self.assertRaises(semantic_compliance.SemanticProtocolError):
+            semantic_compliance._audit_risks({"risks": [{
+                "id": "0", "category": "abuse", "reason": "辱骂称谓",
+                "handling": "safe",
+            }]}, {"0"}, current_by_id={"0": "她叫他贱人。"})
+
+    def test_located_rewrite_can_change_risk_sentence_only(self):
+        current = "她骂他是贱人。他拿起钥匙离开。"
+        candidate = "她批评他太过分了。他丢下钥匙离开。"
+        kept = semantic_compliance._retain_located_edits(
+            current, candidate, [{"category": "abuse", "span": "贱人"}]
+        )
+        self.assertEqual(kept, "她批评他太过分了。他拿起钥匙离开。")
+
+    def test_same_risk_category_does_not_count_as_verified_reduction(self):
+        original = "他撕开她的衣领。\n她骂他贱人。"
+        candidate = "他强行扯开她的衣领。\n她说他太过分。"
+        baseline = (semantic_compliance.Risk("0", "violence", "", "撕开"),
+                    semantic_compliance.Risk("1", "abuse", "", "贱人"))
+        final = (semantic_compliance.Risk("0", "violence", "", "强行扯开"),)
+        restored, rejected = semantic_compliance._restore_unimproved_edits(
+            original, candidate, baseline, final
+        )
+        self.assertEqual(restored, "他撕开她的衣领。\n她说他太过分。")
+        self.assertEqual(rejected, {"0"})
+
+    def test_exact_safe_swap_is_kept_when_story_risk_category_remains(self):
+        original = "她被叫作小三，伤得只剩下一口气。"
+        candidate = "她被叫作第三者，伤得只剩下一口气。"
+        baseline = (semantic_compliance.Risk("0", "abuse", "", "小三"),)
+        final = (semantic_compliance.Risk("0", "abuse", "", "第三者"),)
+        restored, rejected = semantic_compliance._restore_unimproved_edits(
+            original, candidate, baseline, final
+        )
+        self.assertEqual(restored, candidate)
+        self.assertFalse(rejected)
+
+    def test_fertility_and_unstated_smile_are_preserved(self):
+        self.assertTrue(semantic_compliance._concrete_fact_lost(
+            "连个孩子都生不出来，干活磨磨唧唧。",
+            "一直没怀孕，干活慢吞吞的。",
+        ))
+        self.assertTrue(semantic_compliance._concrete_fact_lost(
+            "她甜腻腻的声音响起。", "她带着笑意的声音响起。",
+        ))
+
+    def test_medical_devices_and_near_fainting_are_preserved(self):
+        original = "她脸色苍白，戴着氧气罩，手背插着输液针，随时会昏过去。"
+        self.assertTrue(semantic_compliance._concrete_fact_lost(
+            original, "她正在接受治疗，神情十分虚弱。",
+        ))
+        self.assertFalse(semantic_compliance._concrete_fact_lost(
+            original, "她面色苍白，戴着氧气罩，手背还插着输液针，像随时会晕倒。",
+        ))
+
+    def test_stated_symptoms_and_specific_insults_are_not_erased(self):
+        cases = (
+            ("呛得人眼睛发酸。", "闻到气味。"),
+            ("她嘴唇发白，颤巍巍地开口。", "她脸色苍白，声音发颤。"),
+            ("顾迟却不嫌脏。", "顾迟却并不介意。"),
+            ("你简直就是泼妇，疯子！", "你太过分了！"),
+        )
+        for original, current in cases:
+            with self.subTest(original=original):
+                self.assertTrue(semantic_compliance._concrete_fact_lost(original, current))
+
+    def test_known_mild_insult_is_softened_without_losing_fertility_fact(self):
+        original = "连个孩子都生不出来，干活还磨磨唧唧。"
+        expected = "连个孩子都生不出来，干活还慢手慢脚。"
+        self.assertEqual(semantic_compliance._safe_expression_swaps(original), expected)
+        self.assertFalse(semantic_compliance._concrete_fact_lost(original, expected))
+
+    def test_residual_literal_swaps_preserve_accusation_and_death(self):
+        self.assertEqual(
+            semantic_compliance._safe_expression_swaps("男小三说这里脏死了，民政局脏得要死。"),
+            "男性第三者说这里太脏了，民政局非常脏。",
+        )
+        self.assertEqual(
+            semantic_compliance._safe_violence_swaps("她只剩下一口气，没一会就死了。"),
+            "她生命垂危，很快去世了。",
+        )
+        self.assertFalse(semantic_compliance._death_state_changed("这里脏死了。", "这里太脏了。"))
+        self.assertFalse(semantic_compliance._death_state_changed("她只剩下一口气。", "她生命垂危。"))
+        self.assertTrue(semantic_compliance._death_state_changed("她死了。", "她离开了。"))
+
+    def test_rewrite_cannot_invent_motive_or_moral_commentary(self):
+        cases = (
+            ("每次简宁的事都是他出面摆平。", "每次简宁遇到困难，他都会出面帮忙。"),
+            ("我还是选择委屈自己跟他回家。", "我决定先回家，再慢慢理清自己的想法。"),
+            ("我不同意他去陪池语吃夜宵。", "我反对——这种行为严重违背了家庭责任与基本伦理。"),
+            ("某些人今年要是再怀不上，直接换人算了。", "某些人今年要是再怀不上，那就别耽误彼此了。"),
+            ("心脏监护器停跳的声音。", "心脏监护器发出的长鸣声。"),
+        )
+        for original, current in cases:
+            with self.subTest(original=original):
+                self.assertTrue(semantic_compliance._concrete_fact_lost(original, current))
+
+    def test_monitor_stop_sound_cannot_become_unstated_alarm(self):
+        self.assertTrue(semantic_compliance._concrete_fact_lost(
+            "心脏监护器停跳的声音。", "心脏监护器发出的停跳警报声。",
+        ))
+
+    def test_firm_grip_cannot_become_gentle_grip(self):
+        self.assertTrue(semantic_compliance._concrete_fact_lost(
+            "母亲紧紧握住我的手腕。", "母亲轻轻握住我的手腕。",
+        ))
+
+    def test_touching_a_belt_cannot_become_approaching_a_waist(self):
+        self.assertTrue(semantic_compliance._concrete_fact_lost(
+            "他的手指碰到我腰带的瞬间，门开了。", "他的手逼近我腰间的瞬间，门开了。",
+        ))
+
+    def test_saliva_running_down_a_hand_cannot_become_merely_wetting_it(self):
+        self.assertTrue(semantic_compliance._active_liquid_lost(
+            "口水顺着顾迟的手流下。", "唾液沾湿了顾迟的手。",
+        ))
+        self.assertFalse(semantic_compliance._active_liquid_lost(
+            "口水顺着顾迟的手流下。", "唾液沿着顾迟的手淌下。",
+        ))
+
+    def test_voice_borrowing_and_voluntary_handover_facts_survive_rewrite(self):
+        cases = (
+            ("她声音软软的。", "她声音微微发颤。"),
+            ("我真的只借用一段时间。", "我只用一阵子。"),
+            ("本该属于自己的东西，都要拱手相让。", "本该属于自己的东西也难以守住。"),
+        )
+        for original, current in cases:
+            with self.subTest(original=original):
+                self.assertTrue(semantic_compliance._concrete_fact_lost(original, current))
+
+    def test_hair_location_hand_washing_and_pretending_are_preserved(self):
+        cases = (
+            ("他替她理了理头发。", "他帮她整理了一下额前的碎发。"),
+            ("裙子是我帮你手洗熨好的。", "裙子是我帮你洗好熨平的。"),
+            ("割腕吃药你哪样没装过？", "割腕吃药你哪样没试过？"),
+        )
+        for original, current in cases:
+            with self.subTest(original=original):
+                self.assertTrue(semantic_compliance._concrete_fact_lost(original, current))
+
+    def test_mocking_gaze_and_rhetorical_negation_survive_rewrite(self):
+        cases = (
+            ("她眼神戏谑，认定我生气。", "她目光微动，认定我生气。"),
+            ("原来我的妻子不是不会心疼人。", "原来我的妻子也会心疼人。"),
+        )
+        for original, current in cases:
+            with self.subTest(original=original):
+                self.assertTrue(semantic_compliance._concrete_fact_lost(original, current))
+
+    def test_story_risk_is_reported_without_automatic_rewrite(self):
+        original = "她被人反复辱骂。"
+        story = semantic_compliance.Risk("0", "abuse", "反复辱骂属于故事事实", "反复辱骂", "story")
+        with patch.object(semantic_compliance, "audit_text", return_value=(story,)) as audit, \
+             patch.object(semantic_compliance, "rewrite_flagged") as rewrite:
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.remaining_risks[0].handling, "story")
+        self.assertEqual(result.text, original)
+        audit.assert_called_once()
+        rewrite.assert_not_called()
+
+    def test_unresolved_wording_after_two_rounds_needs_human_review(self):
+        original = "她把受害者叫作破鞋。"
+        risk = semantic_compliance.Risk("0", "abuse", "侮辱性称谓", "破鞋")
+        with patch.object(semantic_compliance, "audit_text", return_value=(risk,)), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=original), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.remaining_risks[0].handling, "uncertain")
+
+    def test_empty_content_audit_requires_independent_confirmation(self):
+        replies = iter([
+            '{"risks":[]}',
+            '{"risks":[{"id":"0","category":"violence","reason":"危险行为细节"}]}',
+        ])
+        def post(_url, *, headers, json, timeout):
+            return self.semantic_response(next(replies))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post) as http:
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original="危险行为细节。", current="危险行为细节。", extra_rules="",
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "violence"),))
+        self.assertEqual(http.call_count, 2)
+
+    def test_audit_drops_self_negating_abuse_label_and_confirms_empty(self):
+        replies = iter([
+            '{"risks":[{"id":"0","category":"abuse","reason":"对话提及吃饭，未涉及侮辱或歧视。"}]}',
+            '{"risks":[]}',
+        ])
+        with patch.object(semantic_compliance.requests, "post", side_effect=lambda *args, **kwargs:
+                          self.semantic_response(next(replies))) as http:
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original="她说吃饭了。", current="她说吃饭了。", extra_rules="",
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+        self.assertEqual(http.call_count, 2)
+
+    def test_unusually_dense_risks_get_independent_confirmation(self):
+        original = "\n".join(f"普通叙述第{index}句。" for index in range(12))
+        calls = []
+        def post(_url, *, headers, json, timeout):
+            calls.append(json["messages"][0]["content"])
+            if len(calls) == 1:
+                payload = __import__("json").loads(json["messages"][1]["content"])
+                return self.semantic_response(__import__("json").dumps({"risks": [
+                    {"id": row["id"], "category": "abuse", "reason": "明确辱骂"}
+                    for row in payload["paragraphs"]
+                ]}, ensure_ascii=False))
+            return self.semantic_response('{"risks":[{"id":"3","category":"abuse","reason":"明确辱骂"}]}')
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, extra_rules="", max_chars=4000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("3", "abuse"),))
+        self.assertEqual(len(calls), 2)
+
+    def test_impossible_fidelity_only_result_still_confirms_content_risk(self):
+        replies = iter([
+            '{"risks":[{"id":"0","category":"fidelity","reason":"误报"}]}',
+            '{"risks":[{"id":"0","category":"violence","reason":"危险行为细节"}]}',
+        ])
+        def post(_url, *, headers, json, timeout):
+            return self.semantic_response(next(replies))
+        with patch.object(semantic_compliance.requests, "post", side_effect=post) as http:
+            risks = semantic_compliance.audit_text(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original="危险行为细节。", current="危险行为细节。", extra_rules="",
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "violence"),))
+        self.assertEqual(http.call_count, 2)
+
+    def test_empty_content_confirmation_failure_is_not_clean(self):
+        with patch.object(semantic_compliance.requests, "post", side_effect=[
+            self.semantic_response('{"risks":[]}'),
+            requests.Timeout("复核超时"),
+        ]):
+            with self.assertRaises(semantic_compliance.SemanticProtocolError):
+                semantic_compliance.audit_text(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original="危险行为细节。", current="危险行为细节。", extra_rules="",
+                    max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+
+    def test_tone_only_fact_verdict_overrides_broad_fidelity_false_alarm(self):
+        original = "“不嫌晦气？”"
+        current = "“不嫌不吉利？”"
+        broad = (semantic_compliance.Risk("0", "fidelity", "情节变化"),)
+        def facts(**kwargs):
+            kwargs["verdicts_out"]["0"] = "tone_only"
+            return ()
+        with patch.object(semantic_compliance, "audit_text", return_value=broad) as audit, \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=facts), \
+             patch.object(semantic_compliance, "rewrite_flagged") as rewrite:
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, current)
+        self.assertEqual(result.review_status, "complete")
+        self.assertEqual(result.remaining_risks, ())
+        audit.assert_called_once()
+        rewrite.assert_not_called()
+
+    def test_exact_benign_expression_swap_survives_model_fact_false_alarm(self):
+        original = "她说：‘真晦气，听说病人快死了。’"
+        current = "她说：‘真不吉利，听说病人快死了。’"
+        reply = '{"verdicts":[{"id":"0","verdict":"core_change"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_expression_swap_with_lost_death_fact_is_still_fidelity_risk(self):
+        original = "她说：‘真晦气，听说病人快死了。’"
+        current = "她说：‘真不吉利，听说病人不舒服。’"
+        reply = '{"verdicts":[{"id":"0","verdict":"core_change"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_detail_only_fact_verdict_preserves_safe_method_abstraction(self):
+        original = "她割了脉。"
+        current = "她伤害了自己。"
+        broad = (semantic_compliance.Risk("0", "fidelity", "具体方法变化"),)
+        def facts(**kwargs):
+            kwargs["verdicts_out"]["0"] = "detail_only"
+            return ()
+        with patch.object(semantic_compliance, "audit_text", return_value=broad), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=facts), \
+             patch.object(semantic_compliance, "rewrite_flagged") as rewrite:
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, current)
+        self.assertEqual(result.review_status, "complete")
+        self.assertEqual(result.remaining_risks, ())
+        rewrite.assert_not_called()
+
+    def test_known_core_drift_cannot_be_cleared_by_later_conflicting_verdict(self):
+        original = "她未经同意被结扎。"
+        current = "她未经同意做了手术。"
+        drift = (semantic_compliance.Risk("0", "fidelity", "手术类型丢失"),)
+        calls = 0
+        def facts(**kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["verdicts_out"]["0"] = "core_change" if calls == 1 else "tone_only"
+            return drift if calls == 1 else ()
+        with patch.object(semantic_compliance, "audit_text", return_value=drift), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=facts), \
+             patch.object(semantic_compliance, "rewrite_flagged", side_effect=semantic_compliance.SemanticProtocolError("重改故障")):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+        self.assertNotEqual(result.remaining_risks, ())
+
+    def test_known_core_drift_cannot_escape_when_final_fact_check_fails(self):
+        original = "她未经同意被结扎。"
+        current = "她未经同意做了手术。"
+        drift = (semantic_compliance.Risk("0", "fidelity", "手术类型丢失"),)
+        calls = 0
+        def facts(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                kwargs["verdicts_out"]["0"] = "core_change"
+                return drift
+            raise semantic_compliance.SemanticProtocolError("最终核对故障")
+        with patch.object(semantic_compliance, "audit_text", side_effect=[drift, ()]), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=facts), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=current):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+
+    def test_every_confirmed_drift_version_stays_rejected(self):
+        original = "她未经同意被结扎。"
+        first = "她未经同意做了手术。"
+        second = "她未经同意接受治疗。"
+        drift = (semantic_compliance.Risk("0", "fidelity", "手术类型丢失"),)
+        fact_calls = 0
+        def facts(**kwargs):
+            nonlocal fact_calls
+            fact_calls += 1
+            if fact_calls in (1, 3):
+                kwargs["verdicts_out"]["0"] = "core_change"
+                return drift
+            return ()
+        with patch.object(semantic_compliance, "audit_text", side_effect=[drift, drift, ()]), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=facts), \
+             patch.object(semantic_compliance, "rewrite_flagged", side_effect=[second, first]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=first, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+
+    def test_rejected_candidate_stays_rejected_when_later_fact_check_misses_it(self):
+        original = "她未经同意被结扎。"
+        candidate = "她未经同意做了手术。"
+        content = (semantic_compliance.Risk("0", "violence", "内容风险"),)
+        drift = (semantic_compliance.Risk("0", "fidelity", "手术类型丢失"),)
+        with patch.object(semantic_compliance, "audit_text", side_effect=[content, content, ()]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[drift, (), ()]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertNotEqual(result.review_status, "complete")
+
+    def test_fidelity_fallback_keeps_confirmed_original_content_risk(self):
+        original = "危险行为。"
+        candidate = "事实改变。"
+        content = (semantic_compliance.Risk("0", "violence", "原文内容风险"),)
+        drift = (semantic_compliance.Risk("0", "fidelity", "候选改变事实"),)
+        with patch.object(semantic_compliance, "audit_text", return_value=content), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[drift, ()]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+        self.assertIn(semantic_compliance.Risk("0", "violence"), result.remaining_risks)
+        self.assertIn(semantic_compliance.Risk("0", "fidelity"), result.remaining_risks)
+
+    def test_final_fact_fallback_keeps_original_content_risk(self):
+        original = "危险行为。"
+        candidate = "安全措辞。"
+        content = (semantic_compliance.Risk("0", "violence", "原文内容风险"),)
+        drift = (semantic_compliance.Risk("0", "fidelity", "候选改变事实"),)
+        with patch.object(semantic_compliance, "audit_text", return_value=content), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[(), drift]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+        self.assertIn(semantic_compliance.Risk("0", "violence"), result.remaining_risks)
+        self.assertIn(semantic_compliance.Risk("0", "fidelity"), result.remaining_risks)
+
+    def test_content_audit_fault_after_drift_repair_is_unverified(self):
+        original = "她未经同意被结扎。"
+        drifted = "她未经同意做了手术。"
+        repaired = "她未经同意被结扎了。"
+        drift = (semantic_compliance.Risk("0", "fidelity", "手术类型丢失"),)
+        def facts(**kwargs):
+            if kwargs.get("verdicts_out") is not None:
+                kwargs["verdicts_out"]["0"] = "core_change"
+            return drift if kwargs["current"] == drifted else ()
+        with patch.object(semantic_compliance, "audit_text", side_effect=[drift, semantic_compliance.SemanticProtocolError("内容复核故障")]), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=facts), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=repaired):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=drifted, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, repaired)
+        self.assertEqual(result.review_status, "unverified")
+
+    def test_changed_fact_review_compares_only_changed_paragraphs(self):
+        original = "她未经同意被结扎。\n未改变的段落。\n"
+        current = "她未经同意做了手术。\n未改变的段落。\n"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            requests_seen.append(__import__("json").loads(json["messages"][1]["content"]))
+            return self.semantic_response('{"verdicts":[{"id":"0","verdict":"core_change"}]}')
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+        self.assertEqual(len(requests_seen), 1)
+        self.assertEqual([entry["id"] for entry in requests_seen[0]["paragraphs"]], ["0"])
+
+    def test_changed_fact_review_accepts_method_abstraction_but_rejects_lost_intent(self):
+        original = "她割了脉。\n她闹着自杀。\n她闻着下身的血腥味。\n"
+        current = "她伤害了自己。\n她情绪失控。\n她身体不适。\n"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"},{"id":"1","verdict":"core_change"},{"id":"2","verdict":"core_change"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)) as post:
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("1", "fidelity"), semantic_compliance.Risk("2", "fidelity")))
+        self.assertIn("出血", post.call_args.kwargs["json"]["messages"][0]["content"])
+
+    def test_fact_review_hard_guard_keeps_self_harm_and_suicide_intent(self):
+        original = "他怕我又发疯自残。\n我不再闹着自杀。\n她割了脉。\n我不再闹着自杀。\n他又自残了。\n她想轻生。"
+        current = "他怕我又情绪失控。\n我不再情绪失控。\n她伤害了自己。\n我不再闹着轻生。\n他又想自杀了。\n她想伤害自己。"
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"},' \
+                '{"id":"2","verdict":"detail_only"},' \
+                '{"id":"3","verdict":"tone_only"},' \
+                '{"id":"4","verdict":"tone_only"},' \
+                '{"id":"5","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["0", "1", "4", "5"])
+
+    def test_fact_review_hard_guard_keeps_suicide_intent_polarity(self):
+        original = "她想自杀。\n她想自杀。\n她不想自杀。\n我不再闹着自杀。\n她寻死。"
+        current = "她想自尽。\n她不想自杀。\n她想自杀。\n我又闹着自杀。\n她自尽。"
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"},' \
+                '{"id":"2","verdict":"tone_only"},' \
+                '{"id":"3","verdict":"tone_only"},' \
+                '{"id":"4","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["1", "2", "3"])
+
+    def test_fact_review_hard_guard_checks_each_intent_clause(self):
+        original = "她有自残行为。\n她想自杀，母亲也想自杀。\n她要自杀；他只是旁观。"
+        current = "她有自伤行为。\n她想轻生，母亲只是难过。\n她只是难过；他要自尽。"
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"},' \
+                '{"id":"2","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["1", "2"])
+
+    def test_fact_review_hard_guard_tracks_suicide_subject_and_scope(self):
+        original = ("她没有自杀。\n她想自杀，他没有。\n"
+                    "她不再犹豫就决定自杀。\n她因痛苦想自杀，母亲阻止。")
+        current = ("她自尽了。\n他想自尽，她没有。\n"
+                   "她决定自尽。\n她因痛苦，想自尽，母亲阻止。")
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"},' \
+                '{"id":"2","verdict":"tone_only"},' \
+                '{"id":"3","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["0", "1"])
+
+    def test_fact_review_hard_guard_keeps_death_outcome_and_urgency(self):
+        original = "医生说她快死了。\n医生说她快死了。\n孩子没活下来。\n孩子没活下来。\n她死了。"
+        current = "医生说她情况很不好。\n医生说她快不行了。\n孩子没能长大。\n孩子离世了。\n她快死了。"
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"},' \
+                '{"id":"2","verdict":"tone_only"},' \
+                '{"id":"3","verdict":"tone_only"},' \
+                '{"id":"4","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["0", "2", "4"])
+
+    def test_fact_review_hard_guard_preserves_suicide_referent(self):
+        original = "他劝她别自杀。\n母亲说她想自杀。\n妈妈想自杀。\n他劝她别自杀。"
+        current = "他劝自己别自尽。\n母亲说自己想自尽。\n母亲想轻生。\n他劝自己不要自尽。"
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"},' \
+                '{"id":"2","verdict":"tone_only"},' \
+                '{"id":"3","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["0", "1", "3"])
+
+    def test_fact_review_hard_guard_keeps_death_subject(self):
+        original = "母亲死了，孩子活了下来。\n孩子没活下来。"
+        current = "孩子死了，母亲活了下来。\n孩子没有活下来。"
+        reply = '{"verdicts":[' \
+                '{"id":"0","verdict":"tone_only"},' \
+                '{"id":"1","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current, max_chars=4000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["0"])
+
+    def test_changed_fact_review_rejects_missing_verdict(self):
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response('{"verdicts":[]}')):
+            with self.assertRaises(semantic_compliance.SemanticProtocolError):
+                semantic_compliance.audit_changed_facts(
+                    api_key="fake", model="test", url="https://example.test",
+                    original="她割了脉。", current="她伤害了自己。",
+                    max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+
+    def test_changed_fact_review_rejects_non_string_verdict(self):
+        reply = '{"verdicts":[{"id":"0","verdict":[]}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            with self.assertRaises(semantic_compliance.SemanticProtocolError):
+                semantic_compliance.audit_changed_facts(
+                    api_key="fake", model="test", url="https://example.test",
+                    original="她割了脉。", current="她伤害了自己。",
+                    max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+
+    def test_fact_review_keeps_explicit_referent_when_model_calls_it_tone_only(self):
+        original = "原因是别吵到狗。\n名字空着，可以给狗。"
+        current = "原因是别惊扰到它。\n名字空着，可以留给它。"
+        reply = '{"verdicts":[{"id":"0","verdict":"tone_only"},{"id":"1","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual([risk.id for risk in risks], ["0", "1"])
+
+    def test_fact_review_prompt_distinguishes_dialogue_meaning_from_softened_insult(self):
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"core_change"}]}'
+        )) as post:
+            semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test",
+                original="不嫌晦气？", current="不觉得多余？",
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("晦气变成多余", prompt)
+        self.assertIn("晦气变成碍事或多余", prompt)
+        self.assertIn("晦气变成不吉利", prompt)
+        self.assertIn("贱人变成太过分", prompt)
+
+    def test_fact_review_keeps_bleeding_location_when_model_calls_it_detail_only(self):
+        original = "她闻着下身的血腥味。"
+        current = "她闻着身上的血腥气息。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_accepts_equivalent_bleeding_location(self):
+        original = "她闻着下身的血腥味。"
+        current = "她察觉私处仍在出血。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_fact_review_keeps_active_bleeding_when_model_calls_it_detail_only(self):
+        cases = (
+            ("他们没有发现我的手臂正在流血。", "他们没有发现我的手臂受了伤。"),
+            ("我看见袖子正渗出血。", "我看见袖子上有血迹。"),
+        )
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        for original, current in cases:
+            with self.subTest(original=original), patch.object(
+                semantic_compliance.requests, "post", return_value=self.semantic_response(reply)
+            ):
+                risks = semantic_compliance.audit_changed_facts(
+                    api_key="fake", model="test", url="https://example.test",
+                    original=original, current=current, max_chars=1000,
+                    timeout=30, checkpoint_dir=None,
+                )
+            self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_accepts_bleeding_expressed_without_sensory_detail(self):
+        original = "他们没有发现我的手臂正在流血。"
+        current = "他们没有发现我的手臂仍在出血。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test",
+                original=original, current=current, max_chars=1000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_fact_review_preserves_each_active_bleeding_site(self):
+        cases = (
+            ("她左手还在流血，右手也在流血。", "她左手还在流血。"),
+            ("她下身正在出血，手臂也流血。", "她下身有血迹，手臂也流血。"),
+            ("她的左手和右手都在流血。", "她的右手在流血。"),
+            ("她的下身、手臂都在流血。", "她的手臂在流血。"),
+        )
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        for original, current in cases:
+            with self.subTest(original=original), patch.object(
+                semantic_compliance.requests, "post", return_value=self.semantic_response(reply)
+            ):
+                risks = semantic_compliance.audit_changed_facts(
+                    api_key="fake", model="test", url="https://example.test",
+                    original=original, current=current, max_chars=1000,
+                    timeout=30, checkpoint_dir=None,
+                )
+            self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_ignores_bleeding_that_already_stopped(self):
+        original = "伤口流血已经止住。"
+        current = "伤口已经止住了。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test",
+                original=original, current=current, max_chars=1000,
+                timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_fact_review_rejects_physical_push_changed_to_avoidance(self):
+        original = "她抱过孩子撞开我就要出门。"
+        current = "她抱过孩子侧身避开我就要出门。"
+        reply = '{"verdicts":[{"id":"0","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_accepts_physical_contact_with_same_target(self):
+        original = "她抱过孩子撞开我就要出门。"
+        current = "她抱过孩子推开我就要出门。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_fact_review_rejects_negated_contact_becoming_actual_contact(self):
+        original = "她没有推开我。"
+        current = "她推开我。"
+        reply = '{"verdicts":[{"id":"0","verdict":"tone_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_rejects_bleeding_moved_to_another_body_part(self):
+        original = "她下身出血，手上干净。"
+        current = "她下身疼痛，手上出血。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_rejects_bleeding_moved_to_hand_in_same_clause(self):
+        original = "她下身出血后抓住他的手。"
+        current = "她下身疼痛并看到手指流血。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_fact_review_does_not_call_blood_on_clothing_a_body_symptom(self):
+        original = "下身穿的裙子沾了血。"
+        current = "裙子上还留着血迹。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_fact_review_does_not_treat_wound_as_a_competing_body_part(self):
+        original = "她下身的伤口还在流血。"
+        current = "她身体不适。"
+        reply = '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_changed_fact_review_fallback_when_content_audit_misses_drift(self):
+        original = "她未经同意被结扎。"
+        current = "她未经同意做了手术。"
+        drift = (semantic_compliance.Risk("0", "fidelity", "手术类型丢失"),)
+        with patch.object(semantic_compliance, "audit_text", return_value=()), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=drift):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "fidelity_fallback")
+        self.assertEqual(result.remaining_risks, drift)
+
+    def test_changed_fact_review_failure_falls_back_to_original(self):
+        original = "她未经同意被结扎。"
+        current = "她未经同意做了手术。"
+        with patch.object(semantic_compliance, "audit_text", return_value=()), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=semantic_compliance.SemanticProtocolError("复核故障")):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=current, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, original)
+        self.assertEqual(result.review_status, "unverified")
+
+    def test_fact_repair_preserves_safe_edit_and_line_endings(self):
+        original = "关键行为。\r\n\r\n辱骂表达。\r\n"
+        current = "错误的行为。\r\n\r\n克制表达。\r\n"
+        repaired = semantic_compliance.restore_fidelity_paragraphs(
+            original, current, (semantic_compliance.Risk("0", "fidelity"),)
+        )
+        self.assertEqual(repaired, "关键行为。\r\n\r\n克制表达。\r\n")
+
+    def test_second_round_fact_repair_restores_previous_valid_paragraph(self):
+        original = "她还想再扇我一次：‘你个贱人！’\n"
+        first = "她还想再扇我一次：‘你太过分了！’\n"
+        second = "她指责我：‘你太过分了！’\n"
+        repaired = semantic_compliance.restore_fidelity_paragraphs(
+            original, second, (semantic_compliance.Risk("0", "fidelity"),), fallback_text=first
+        )
+        self.assertEqual(repaired, first)
+
+    def test_second_round_drift_keeps_first_round_safe_edit_in_pipeline(self):
+        original = "她还想再扇我一次：‘你个贱人！’"
+        first = "她还想再扇我一次：‘你太过分了！’"
+        second = "她指责我：‘你太过分了！’"
+        content = (semantic_compliance.Risk("0", "abuse", "措辞风险"),)
+        drift = (semantic_compliance.Risk("0", "fidelity"),)
+        with patch.object(semantic_compliance, "audit_text", return_value=content), \
+             patch.object(semantic_compliance, "rewrite_flagged", side_effect=[first, second]), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[(), drift, ()]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, first)
+        self.assertEqual(result.review_status, "fidelity_repaired")
+
+    def test_fidelity_label_on_unchanged_source_cannot_discard_other_safe_edits(self):
+        original = "原文动作。\n骂人句。\n"
+        safe = "原文动作。\n克制句。\n"
+        first_risks = (semantic_compliance.Risk("0", "fidelity", "误标原文"),
+                       semantic_compliance.Risk("1", "abuse", "措辞风险"))
+        with patch.object(semantic_compliance, "audit_text", side_effect=[first_risks, ()]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=safe), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, safe)
+        self.assertEqual(result.review_status, "complete")
+
+    def test_final_fact_drift_repairs_only_affected_line_and_reaudits(self):
+        original = "关键行为。\n辱骂表达。\n"
+        candidate = "错误行为。\n克制表达。\n"
+        repaired = "关键行为。\n克制表达。\n"
+        drift = (semantic_compliance.Risk("0", "fidelity", "关键行为改变"),)
+        residual = (semantic_compliance.Risk("0", "violence", "仍有风险"),)
+
+        def audit(**kwargs):
+            if kwargs["current"] == candidate:
+                return ()
+            self.assertEqual(kwargs["current"], repaired)
+            return residual
+
+        with patch.object(semantic_compliance, "audit_text", side_effect=audit), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[drift, ()]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=candidate, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, repaired)
+        self.assertEqual(result.review_status, "fidelity_repaired")
+        self.assertEqual(result.remaining_risks, residual)
+
+    def test_final_content_audit_drift_repairs_only_affected_line(self):
+        original = "关键行为。\n辱骂表达。\n"
+        candidate = "错误行为。\n克制表达。\n"
+        content = (semantic_compliance.Risk("0", "violence", "风险表达"),)
+        drift = (semantic_compliance.Risk("0", "fidelity", "事实改变"),)
+
+        def audit(**kwargs):
+            if kwargs["current"] == candidate:
+                audit.at_candidate += 1
+                return content if audit.at_candidate < 3 else drift
+            self.assertEqual(kwargs["current"], "关键行为。\n克制表达。\n")
+            return content
+        audit.at_candidate = 0
+
+        with patch.object(semantic_compliance, "audit_text", side_effect=audit), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=candidate, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "关键行为。\n克制表达。\n")
+        self.assertEqual(result.review_status, "fidelity_repaired")
+        self.assertEqual(result.remaining_risks, content)
+
+    def test_each_rewrite_repairs_fact_drift_before_next_round(self):
+        original = "关键行为。\n辱骂表达。\n"
+        first = "错误行为。\n克制表达。\n"
+        repaired = "关键行为。\n克制表达。\n"
+        final = "关键行为已发生。\n克制表达。\n"
+        content = (semantic_compliance.Risk("0", "violence", "仍需降低强度"),)
+        drift = (semantic_compliance.Risk("0", "fidelity"),)
+        seen = []
+        def rewrite(**kwargs):
+            seen.append((kwargs["current"], kwargs["failed_fact_edits"]))
+            return first if len(seen) == 1 else final
+        with patch.object(semantic_compliance, "audit_text", return_value=content), \
+             patch.object(semantic_compliance, "rewrite_flagged", side_effect=rewrite), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[drift, (), ()]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=original, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(seen, [(original, {}), (repaired, {"0": "错误行为。"})])
+        self.assertEqual(result.text, final)
+
+    def test_targeted_rewrite_receives_rejected_fact_edit_as_feedback(self):
+        original = "他将我绑在婴儿床边。"
+        requests_seen = []
+        def post(_url, *, headers, json, timeout):
+            requests_seen.append(json)
+            return self.semantic_response('{"0":"他将我绑在婴儿床边。"}')
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "violence"),),
+                failed_fact_edits={"0": "他将我拦在婴儿床边。"},
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        payload = json.loads(requests_seen[0]["messages"][1]["content"])
+        self.assertEqual(payload["paragraphs"][0]["previous_rejected"], "他将我拦在婴儿床边。")
+        self.assertIn("previous_rejected", requests_seen[0]["messages"][0]["content"])
+
+    def test_located_risk_paragraphs_are_rewritten_separately(self):
+        original = "他骂她太坏了。\n她看到满地血迹。\n"
+        payloads = []
+        def post(_url, *, headers, json, timeout):
+            payload = __import__("json").loads(json["messages"][1]["content"])
+            payloads.append(payload)
+            identifier = payload["paragraphs"][0]["id"]
+            return self.semantic_response(__import__("json").dumps({
+                identifier: payload["paragraphs"][0]["current"]
+            }, ensure_ascii=False))
+        risks = (
+            semantic_compliance.Risk("0", "abuse", "辱骂措辞", "太坏了"),
+            semantic_compliance.Risk("1", "violence", "血腥感官描写", "满地血迹"),
+        )
+        with patch.object(semantic_compliance.requests, "post", side_effect=post):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, risks=risks,
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, original)
+        self.assertEqual([[entry["id"] for entry in payload["paragraphs"]] for payload in payloads], [["0"], ["1"]])
+
+    def test_known_softenable_expression_changes_even_if_model_returns_original(self):
+        original = "现在正湿答答滴着婴儿尿。"
+        risks = semantic_compliance._supplement_expression_risks(original, original, ())
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"0":"现在正湿答答滴着婴儿尿。"}'
+        )):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, risks=risks,
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, "现在正滴着婴儿尿。")
+
+    def test_unlucky_insult_keeps_natural_question_wording(self):
+        original = "“一只铃铛而已，你藏三年不嫌晦气？”"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            json.dumps({"0": original}, ensure_ascii=False)
+        )):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "不文明用语", "晦气"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, "“一只铃铛而已，你藏三年不觉得不吉利？”")
+
+    def test_natural_unlucky_question_survives_model_fact_false_alarm(self):
+        original = "“一只铃铛而已，你藏三年不嫌晦气？”"
+        current = "“一只铃铛而已，你藏三年不觉得不吉利？”"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"core_change"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_limited_violence_wording_swaps_preserve_context(self):
+        examples = (
+            ("他赶回来时，女儿的尸体都已经被推进了太平间。",
+             "他赶回来时，女儿的遗体都已经被推进了太平间。"),
+            ("脸被猛地扇偏，火辣辣的痛。", "脸被猛地扇偏，疼得厉害。"),
+        )
+        for original, expected in examples:
+            with self.subTest(original=original), patch.object(
+                semantic_compliance.requests, "post", return_value=self.semantic_response(
+                    json.dumps({"0": original}, ensure_ascii=False)
+                )
+            ):
+                revised = semantic_compliance.rewrite_flagged(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original=original, current=original,
+                    risks=(semantic_compliance.Risk("0", "violence", "描写强度", original),),
+                    extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+                self.assertEqual(revised, expected)
+
+    def test_exact_violence_wording_swaps_survive_model_fact_false_alarm(self):
+        examples = (
+            ("他赶回来时，女儿的尸体都已经被推进了太平间。",
+             "他赶回来时，女儿的遗体都已经被推进了太平间。"),
+            ("脸被猛地扇偏，火辣辣的痛。", "脸被猛地扇偏，疼得厉害。"),
+        )
+        for original, current in examples:
+            with self.subTest(original=original), patch.object(
+                semantic_compliance.requests, "post", return_value=self.semantic_response(
+                    '{"verdicts":[{"id":"0","verdict":"core_change"}]}'
+                )
+            ):
+                risks = semantic_compliance.audit_changed_facts(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original=original, current=current,
+                    max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+                self.assertEqual(risks, ())
+
+    def test_second_round_cannot_reintroduce_a_removed_risk_expression(self):
+        original = "脸被猛地扇偏，火辣辣的痛。"
+        current = "脸被猛地扇偏，疼得厉害。"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            json.dumps({"0": original}, ensure_ascii=False)
+        )):
+            revised = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                risks=(semantic_compliance.Risk("0", "violence", "扇脸动作", current),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(revised, current)
+
+    def test_located_rewrite_keeps_safe_word_change_without_losing_distant_action(self):
+        original = "她还想再扇我一次：‘你个贱人！’"
+        reply = '{"0":"她指责我：‘你太过分了！’"}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "辱骂", "贱人"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, "她还想再扇我一次：‘你太过分了！’")
+
+    def test_abuse_rewrite_preserves_slap_when_audited_span_is_broad(self):
+        original = "她还想再扇我一次：‘你个贱人！’"
+        reply = '{"0":"她指责我：‘你太过分了！’"}'
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(reply)):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "辱骂", "她还想再扇我一次：‘你个贱人"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, "她还想再扇我一次：‘你太过分了！’")
+
+    def test_slap_action_loss_is_fidelity_drift_even_if_model_calls_it_tone(self):
+        original = "她还想再扇我一次：‘你个贱人！’"
+        current = "她指责我：‘你太过分了！’"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"tone_only"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_severe_pain_cannot_be_reduced_to_unspecified_pain(self):
+        original = "我的小腹撞到桌角，一股尖锐的疼爬满全身。"
+        current = "我的小腹撞到桌角，一阵疼痛传来。"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_concrete_injury_and_action_facts_cannot_disappear(self):
+        examples = (
+            ("可以让我先包扎伤口吗？", "可以让我先处理一下吗？"),
+            ("他注意到沾血的柜角。", "他注意到了柜角。"),
+            ("我弹了弹烟灰。", "我随口答道。"),
+            ("她嘴唇红肿，靠在他身边。", "她靠在他身边。"),
+        )
+        for original, current in examples:
+            with self.subTest(original=original), patch.object(
+                semantic_compliance.requests, "post", return_value=self.semantic_response(
+                    '{"verdicts":[{"id":"0","verdict":"tone_only"}]}'
+                )
+            ):
+                risks = semantic_compliance.audit_changed_facts(
+                    api_key="fake", model="test", url="https://example.test/chat/completions",
+                    original=original, current=current,
+                    max_chars=1000, timeout=30, checkpoint_dir=None,
+                )
+                self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_active_liquid_cannot_be_changed_to_a_dripping_stain(self):
+        original = "现在正湿答答滴着婴儿尿。"
+        current = "现在正滴着婴儿的尿渍。"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_exact_insult_swap_does_not_require_ai_fact_approval(self):
+        original = "她还想再扇我一次：‘你个贱人！’"
+        current = "她还想再扇我一次：‘你太过分了！’"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"core_change"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, ())
+
+    def test_known_expression_is_repaired_when_audit_marks_a_different_span(self):
+        original = "她还想再扇我一次：‘你个贱人！’"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"0":"她指责我：‘你太过分了！’"}'
+        )):
+            result = semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original,
+                risks=(semantic_compliance.Risk("0", "abuse", "辱骂", "还想再扇我一次"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result, "她还想再扇我一次：‘你太过分了！’")
+
+    def test_bodywide_pain_cannot_be_reduced_to_local_pain(self):
+        original = "我的小腹撞到桌角，一股尖锐的疼爬满全身。"
+        current = "我的小腹撞到桌角，疼得厉害。"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_stabbing_pain_cannot_be_reduced_to_mild_pain(self):
+        original = "我的手肘撞到柜角，一阵钻心的疼痛蔓延。"
+        current = "我的手肘撞到柜角，有些疼痛。"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"verdicts":[{"id":"0","verdict":"detail_only"}]}'
+        )):
+            risks = semantic_compliance.audit_changed_facts(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=current,
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(risks, (semantic_compliance.Risk("0", "fidelity"),))
+
+    def test_abuse_rewrite_prompt_preserves_unrelated_medical_and_death_facts(self):
+        original = "她说：‘你真晦气，听说病人快死了。’"
+        with patch.object(semantic_compliance.requests, "post", return_value=self.semantic_response(
+            '{"0":"她说：‘你真不吉利，听说病人快死了。’"}'
+        )) as post:
+            semantic_compliance.rewrite_flagged(
+                api_key="fake", model="test", url="https://example.test/chat/completions",
+                original=original, current=original, risks=(semantic_compliance.Risk("0", "abuse"),),
+                extra_rules="", max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("只改侮辱或歧视用语", prompt)
+        self.assertIn("快死了改成情况不太好", prompt)
+
+    def test_persistent_detected_drift_repairs_line_without_discarding_safe_edit(self):
+        original = "关键行为。\n辱骂表达。\n"
+        candidate = "错误行为。\n克制表达。\n"
+        drift = (semantic_compliance.Risk("0", "fidelity", "事实改变"),)
+        residual = (semantic_compliance.Risk("0", "violence", "原文仍有风险"),)
+
+        def audit(**kwargs):
+            if kwargs["current"] == candidate:
+                return drift
+            self.assertEqual(kwargs["current"], "关键行为。\n克制表达。\n")
+            return residual
+
+        with patch.object(semantic_compliance, "audit_text", side_effect=audit), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original=original,
+                current=candidate, extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "关键行为。\n克制表达。\n")
+        self.assertEqual(result.review_status, "fidelity_repaired")
+        self.assertEqual(result.remaining_risks, residual)
+
+    def test_semantic_review_limits_to_two_rewrites_and_returns_content_risk(self):
+        remaining = (semantic_compliance.Risk("0", "violence"),)
+        with patch.object(semantic_compliance, "audit_text", side_effect=[remaining, remaining, remaining]) as audit, \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value="平静文字。") as rewrite:
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="平静文字。",
+                current="平静文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.remaining_risks, remaining)
+        self.assertEqual(result.text, "平静文字。")
+        self.assertEqual(audit.call_count, 3)
+        self.assertEqual(rewrite.call_count, 2)
+
+    def test_semantic_review_ignores_impossible_fidelity_on_original_text(self):
+        drift = (semantic_compliance.Risk("0", "fidelity"),)
+        with patch.object(semantic_compliance, "audit_text", side_effect=[drift, drift, drift]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value="平静文字。"):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="平静文字。",
+                current="平静文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "平静文字。")
+        self.assertEqual(result.review_status, "complete")
+        self.assertEqual(result.remaining_risks, ())
+
+    def test_semantic_review_ignores_unchanged_source_fidelity_label(self):
+        drift = (semantic_compliance.Risk("0", "fidelity"),)
+        with patch.object(semantic_compliance, "audit_text", side_effect=[drift, ()]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value="平静文字。"):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="平静文字。",
+                current="平静文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.review_status, "complete")
+        self.assertEqual(result.text, "平静文字。")
+
+    def test_semantic_audit_failure_reverts_unchecked_initial_candidate(self):
+        with patch.object(semantic_compliance, "audit_text", side_effect=semantic_compliance.SemanticProtocolError("复核故障")):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="原始文字。",
+                current="改写文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "原始文字。")
+        self.assertEqual(result.review_status, "unverified")
+
+    def test_final_fact_review_failure_keeps_previously_verified_candidate(self):
+        original = "含风险的原文。"
+        candidate = "克制的成稿。"
+        content = (semantic_compliance.Risk("0", "violence"),)
+        with patch.object(semantic_compliance, "audit_text", side_effect=[content, ()]), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value=candidate), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=[(), semantic_compliance.SemanticProtocolError("最终复核故障")]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test",
+                original=original, current=original, extra_rules="", banned_terms=(),
+                replacements={}, max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, candidate)
+        self.assertEqual(result.review_status, "unverified")
+
+    def test_later_content_rewrite_failure_keeps_fidelity_repaired_candidate(self):
+        fidelity = (semantic_compliance.Risk("0", "fidelity"),)
+        content = (semantic_compliance.Risk("0", "violence"),)
+        with patch.object(semantic_compliance, "audit_text", side_effect=[fidelity, content]), \
+             patch.object(semantic_compliance, "audit_changed_facts", return_value=()), \
+             patch.object(semantic_compliance, "rewrite_flagged", side_effect=[
+                 "修复文字。", semantic_compliance.SemanticProtocolError("请求故障"),
+                 semantic_compliance.SemanticProtocolError("请求故障"),
+             ]):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="原始文字。",
+                current="错写文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "修复文字。")
+        self.assertEqual(result.review_status, "partial")
+        self.assertEqual(result.remaining_risks, content)
+
+    def test_fact_review_failure_does_not_release_known_drift(self):
+        drift = (semantic_compliance.Risk("0", "fidelity"),)
+        with patch.object(semantic_compliance, "audit_text", return_value=drift), \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value="修复文字。"), \
+             patch.object(semantic_compliance, "audit_changed_facts", side_effect=semantic_compliance.SemanticProtocolError("事实复核故障")):
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="原始文字。",
+                current="错写文字。", extra_rules="", banned_terms=(), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.text, "原始文字。")
+        self.assertEqual(result.review_status, "fidelity_fallback")
+
+    def test_invalid_semantic_rewrite_cache_is_not_reused(self):
+        risk = semantic_compliance.Risk("0", "violence")
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary)
+            replies = iter(["包含禁词的文字。", "包含禁词的文字。", "平静文字。"])
+            def post(_url, *, headers, json, timeout):
+                return self.semantic_response(__import__("json").dumps({"0": next(replies)}, ensure_ascii=False))
+            with patch.object(semantic_compliance, "audit_text", side_effect=[(risk,), (risk,), ()]), \
+                 patch.object(semantic_compliance.requests, "post", side_effect=post) as http:
+                arguments = dict(api_key="fake", model="test", url="https://example.test", original="平静文字。",
+                                 current="平静文字。", extra_rules="", banned_terms=("禁词",), replacements={},
+                                 max_chars=1000, timeout=30, checkpoint_dir=checkpoint)
+                result = semantic_compliance.review_and_rewrite(**arguments)
+                self.assertEqual(result.review_status, "partial")
+                self.assertEqual(http.call_count, 2)
+                semantic_compliance.review_and_rewrite(**arguments)
+                self.assertGreater(http.call_count, 2)
+
+    def test_semantic_review_rejects_banned_candidate_after_two_attempts_without_blocking(self):
+        risk = (semantic_compliance.Risk("0", "violence"),)
+        with patch.object(semantic_compliance, "audit_text", return_value=risk) as audit, \
+             patch.object(semantic_compliance, "rewrite_flagged", return_value="包含禁词的文字。") as rewrite:
+            result = semantic_compliance.review_and_rewrite(
+                api_key="fake", model="test", url="https://example.test", original="平静文字。",
+                current="平静文字。", extra_rules="", banned_terms=("禁词",), replacements={},
+                max_chars=1000, timeout=30, checkpoint_dir=None,
+            )
+        self.assertEqual(result.review_status, "partial")
+        self.assertEqual(result.text, "平静文字。")
+        self.assertEqual(audit.call_count, 1)
+        self.assertEqual(rewrite.call_count, 2)
+
+    def test_semantic_mode_audits_before_webhook(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            events = []
+            def review(**kwargs):
+                events.append("review")
+                return semantic_compliance.SemanticResult("安全正文。" * 10, (semantic_compliance.Risk("0", "violence"),), 1, 2)
+            def send(_url, path):
+                events.append("send")
+                self.assertEqual(path.read_text(encoding="utf-8"), "安全正文。" * 10)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=review), \
+                 patch.object(rewrite_processor, "send_file", side_effect=send), \
+                 self.assertLogs("test-semantic", level="WARNING") as captured:
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            self.assertEqual(events, ["review", "send"])
+            self.assertEqual(result.read_text(encoding="utf-8"), "安全正文。" * 10)
+            self.assertIn("可能被平台拒绝", "\n".join(captured.output))
+
+    def test_semantic_mode_starts_targeted_review_from_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "原始正文。" * 10
+            source.write_text(original, encoding="utf-8")
+            def review(**kwargs):
+                self.assertEqual(kwargs["original"], original)
+                self.assertEqual(kwargs["current"], original)
+                return semantic_compliance.SemanticResult("克制正文。" * 10, (), 1, 1)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=AssertionError("semantic whole-book pass")) as first, \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=review), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            first.assert_not_called()
+            send.assert_called_once()
+            self.assertEqual(result.read_text(encoding="utf-8"), "克制正文。" * 10)
+
+    def test_semantic_technical_error_preserves_source_without_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=semantic_compliance.SemanticProtocolError("复核失败")), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(rewrite_processor.SemanticReviewIncompleteError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            self.assertEqual(rewrite_processor.recover_claimed_sources(config)[0].read_text(encoding="utf-8"), "原始正文。" * 10)
+
+    def test_semantic_first_pass_failure_waits_for_review_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "原始正文。" * 10
+            source.write_text(original, encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=RuntimeError("AI 离线")), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=semantic_compliance.SemanticProtocolError("复核故障")), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(rewrite_processor.SemanticReviewIncompleteError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            self.assertEqual(rewrite_processor.recover_claimed_sources(config)[0].read_text(encoding="utf-8"), original)
+
+    def test_semantic_unmapped_banned_term_is_masked_before_send_and_voice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=semantic_compliance.SemanticResult("众人抓奸后离开。", (), 1, 0)), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_called_once()
+            self.assertEqual(result.read_text(encoding="utf-8"), "众人〔省略〕后离开。")
+            voice_monitor.ensure_voice_text_allowed(result.read_text(encoding="utf-8"), {"banned_rules_dir": str(root)})
+
+    def test_semantic_chapter_heading_is_removed_before_ai_and_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("第一章\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("第一章 起点\n正文句子。", encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=semantic_compliance.SemanticResult("正文句子。", (), 1, 0)) as review, \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_called_once()
+            self.assertEqual(review.call_args.kwargs['original'],'正文句子。')
+            self.assertEqual(result.read_text(encoding="utf-8"), "正文句子。")
+
+    def test_mask_overlap_never_deletes_unrelated_story(self):
+        original = "重要剧情开端" + "x" * 10 + "结局保留"
+        masked = rewrite_processor._mask_remaining_banned_terms(original, ("x", "〕〔省略"))
+        self.assertTrue(masked.startswith("重要剧情开端"))
+        self.assertTrue(masked.endswith("结局保留"))
+        self.assertFalse(deepseek_client.find_banned_terms(masked, ("x", "〕〔省略")))
+
+    def test_mask_uses_readable_marker_when_default_marker_is_forbidden(self):
+        masked = rewrite_processor._mask_remaining_banned_terms("剧情抓奸结尾", ("抓奸", "省略"))
+        self.assertEqual(masked, "剧情〔隐去〕结尾")
+
+    def test_mask_avoids_private_use_glyph_when_common_symbols_are_forbidden(self):
+        terms = ("抓奸", "省略", *tuple("□◇※·△○☆◆▢◦"))
+        masked = rewrite_processor._mask_remaining_banned_terms("剧情抓奸结尾", terms)
+        self.assertEqual(masked, "剧情〔隐去〕结尾")
+
+    def test_semantic_short_review_candidate_waits_for_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "原始正文。" * 20
+            source.write_text(original, encoding="utf-8")
+            invalid = semantic_compliance.SemanticResult("短句。", (), 1, 1)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=invalid), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(rewrite_processor.SemanticReviewIncompleteError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            self.assertEqual(rewrite_processor.recover_claimed_sources(config)[0].read_text(encoding="utf-8"), original)
+
+    def test_semantic_fidelity_fallback_can_send_short_masked_original(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("抓奸" * 30, encoding="utf-8")
+            fallback = semantic_compliance.SemanticResult(source.read_text(encoding="utf-8"),
+                                                          (semantic_compliance.Risk("0", "fidelity"),), 2, 2,
+                                                          "fidelity_fallback")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=fallback), \
+                 patch.object(rewrite_processor, "send_file") as send, \
+                 self.assertLogs("test-semantic", level="WARNING") as captured:
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_called_once()
+            self.assertNotIn("抓奸", result.read_text(encoding="utf-8"))
+            self.assertIn("候选情节漂移", "\n".join(captured.output))
+
+    def test_fidelity_fallback_metadata_keeps_original_content_risk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("\n危险行为。", encoding="utf-8")
+            fallback = semantic_compliance.SemanticResult(
+                "\n危险行为。", (semantic_compliance.Risk("0", "violence", "危险行为细节", "危险行为"),
+                              semantic_compliance.Risk("0", "fidelity")), 2, 2,
+                "fidelity_fallback",
+            )
+            with patch.object(rewrite_processor, "review_and_rewrite", return_value=fallback), \
+                 patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaisesRegex(RuntimeError, "webhook failed"):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            metadata = json.loads((claimed.parent / "rewrite" / "staged.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["remaining_risks"], [{"id": "0", "category": "violence"}])
+            self.assertEqual(metadata["remaining_risk_details"], [{
+                "id": "0", "line": 2, "category": "violence",
+                "reason": "危险行为细节", "span": "危险行为", "handling": "wording",
+                "evidence_status": "unverified", "evidence": "",
+            }])
+            self.assertFalse(metadata["manual_review_required"])
+            self.assertEqual(metadata["discarded_candidate_risks"], [{"id": "0", "category": "fidelity"}])
+
+    def test_semantic_residual_content_risk_does_not_require_manual_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "他用难听的话辱骂她。" * 12
+            source.write_text(original, encoding="utf-8")
+            reviewed = semantic_compliance.SemanticResult(
+                original, (semantic_compliance.Risk("0", "abuse", "人物辱骂", "辱骂", "story"),), 1, 2,
+                "complete",
+            )
+            with patch.object(rewrite_processor, "review_and_rewrite", return_value=reviewed), \
+                 patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaisesRegex(RuntimeError, "webhook failed"):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            metadata = json.loads((claimed.parent / "rewrite" / "staged.json").read_text(encoding="utf-8"))
+            self.assertFalse(metadata["manual_review_required"])
+            self.assertEqual(metadata["remaining_risks"], [{"id": "0", "category": "abuse"}])
+
+    def test_semantic_automatic_delivery_retains_change_and_risk_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "他说这里脏死了。\n她没有回应。"
+            revised = "他说这里太脏了。\n她没有回应。"
+            source.write_text(original, encoding="utf-8")
+            reviewed = semantic_compliance.SemanticResult(
+                revised, (semantic_compliance.Risk("0", "abuse", "人物仍有贬损性评价", "太脏了", "story",
+                                                   "supported", "太脏了"),),
+                2, 1, "complete", ({"id": "0", "category": "abuse", "span": "脏死了",
+                                    "outcome": "accepted"},),
+            )
+            with patch.object(rewrite_processor, "review_and_rewrite", return_value=reviewed), \
+                 patch.object(rewrite_processor, "send_file"):
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            report_path = result.with_suffix(".semantic-review.json")
+            self.assertTrue(report_path.is_file())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["review_status"], "complete")
+            self.assertEqual(report["changes"], [{"line": 1, "before": "他说这里脏死了。", "after": "他说这里太脏了。"}])
+            self.assertEqual(report["remaining_risks"][0]["category"], "abuse")
+            self.assertEqual(report["risk_summary"]["supported_story"], 1)
+            self.assertEqual(report["remaining_risks"][0]["evidence_status"], "supported")
+            self.assertEqual(report["risk_actions"][0]["outcome"], "accepted")
+            self.assertEqual(result.read_text(encoding="utf-8"), revised)
+
+    def test_production_semantic_pipeline_uses_scene_compiler(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "她骂我是小三。" * 10
+            source.write_text(original, encoding="utf-8")
+            from novel_monitor import scene_review
+            from novel_monitor.scene_document import parse_document, EditOp, compile_edits
+            doc = parse_document(original)
+            def edit(*args):
+                return (EditOp("rewrite", (doc.units[0].id,), ("她骂我是第三者。" * 10,), "克制用语", ()),)
+            def screen(**kwargs):
+                self.assertEqual(kwargs['payload']['task'],'audit_edit_pairs')
+                return dict(verdicts=[dict(pair_id=p['id'],verdict='ok',reason='身份与事实未变',
+                    source_quote='',output_quote='') for p in kwargs['payload']['pairs']])
+            with patch.object(scene_review, "extract_core_facts", return_value=()), \
+                 patch.object(scene_review, "_find_scenes", return_value=[{"source_ids":[doc.units[0].id]}]), \
+                 patch.object(scene_review, "_edit_groups", side_effect=edit), \
+                 patch('novel_monitor.scene_model._request_json',side_effect=screen), \
+                 patch.object(scene_review, "review_scene_candidate", return_value=()), \
+                 patch.object(rewrite_processor, "send_file"):
+                result = rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            self.assertEqual(result.read_text(encoding="utf-8"), "她骂我是第三者。" * 10)
+            report = json.loads(result.with_suffix(".semantic-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["version"], 2)
+            self.assertEqual(report["edit_actions"][0]["source_ids"], ["s000001"])
+
+    def test_isolated_auto_trial_reports_residual_risks_without_manual_selection(self):
+        from tools import isolated_semantic_trial
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_dir, output_dir = root / "source", root / "output"
+            source_dir.mkdir()
+            (source_dir / "novel.txt").write_text("他说这里脏死了。", encoding="utf-8")
+            key_file = root / "key.txt"
+            key_file.write_text("test-key", encoding="utf-8")
+            reviewed = semantic_compliance.SemanticResult(
+                "他说这里太脏了。",
+                (semantic_compliance.Risk("0", "abuse", "人物评价", "太脏了", "story",
+                                          "supported", "太脏了"),),
+                2, 1, "complete", ({"id": "0", "category": "abuse", "span": "脏死了",
+                                    "outcome": "accepted"},),
+            )
+            args = ["trial", "--source", str(source_dir), "--output", str(output_dir),
+                    "--key-file", str(key_file)]
+            with patch("sys.argv", args), patch.object(isolated_semantic_trial, "review_and_rewrite", return_value=reviewed):
+                isolated_semantic_trial.main()
+            report = json.loads((output_dir / "novel-review.json").read_text(encoding="utf-8"))
+            self.assertFalse(report["manual_review_required"])
+            self.assertEqual(report["changes"][0]["line"], 1)
+            self.assertEqual(report["remaining_risks"][0]["category"], "abuse")
+            self.assertEqual(report["risk_summary"]["supported_story"], 1)
+            self.assertEqual(report["risk_actions"][0]["outcome"], "accepted")
+            self.assertEqual((output_dir / "novel.txt").read_text(encoding="utf-8"), "他说这里太脏了。")
+
+    def test_semantic_unverified_result_waits_for_automatic_retry_before_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            original = "原始正文。" * 12
+            source.write_text(original, encoding="utf-8")
+            unverified = semantic_compliance.SemanticResult(original, (), 1, 0, "unverified")
+            complete = semantic_compliance.SemanticResult(original, (), 1, 0, "complete")
+            with patch.object(rewrite_processor, "review_and_rewrite", side_effect=(unverified, complete)) as review, \
+                 patch.object(rewrite_processor, "send_file") as send, \
+                 self.assertLogs("test-semantic", level="WARNING") as captured:
+                with self.assertRaisesRegex(RuntimeError, "语义复核未完成"):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+                send.assert_not_called()
+                claimed = rewrite_processor.recover_claimed_sources(config)[0]
+                metadata = json.loads((claimed.parent / "rewrite" / "staged.json").read_text(encoding="utf-8"))
+                self.assertFalse(metadata["semantic_review_complete"])
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            self.assertEqual(review.call_count, 2)
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(result.read_text(encoding="utf-8"), original)
+            self.assertIn("等待自动重试", "\n".join(captured.output))
+
+    def test_unverified_masked_stage_is_reaudited_before_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=semantic_compliance.SemanticProtocolError("复核故障")), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(rewrite_processor.SemanticReviewIncompleteError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            metadata = json.loads((claimed.parent / "rewrite" / "staged.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["semantic_review_status"], "unverified_masked")
+            self.assertTrue(metadata["banned_mask_applied"])
+            self.assertFalse(metadata["semantic_review_complete"])
+            with patch.object(rewrite_processor, "optimize_text", side_effect=AssertionError("first pass reran")), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=semantic_compliance.SemanticResult("众人抓奸后离开。", (), 1, 0)) as review, \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            review.assert_called_once()
+            send.assert_called_once()
+            self.assertEqual(result.read_text(encoding="utf-8"), "众人〔省略〕后离开。")
+
+    def test_mask_after_clean_audit_is_marked_unverified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸\n", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("众人抓奸后离开。", encoding="utf-8")
+            clean = semantic_compliance.SemanticResult("众人抓奸后离开。", (), 1, 0)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=clean), \
+                 patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaisesRegex(RuntimeError, "webhook failed"):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            metadata = json.loads((claimed.parent / "rewrite" / "staged.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["semantic_review_status"], "complete_masked")
+            self.assertTrue(metadata["banned_mask_applied"])
+
+    def test_existing_semantic_v2_sent_stage_is_not_sent_again(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            claimed = rewrite_processor.claim_source(source, config)
+            staged = claimed.parent / "rewrite" / "staged" / claimed.name
+            staged.parent.mkdir(parents=True)
+            staged.write_text("安全正文。" * 10, encoding="utf-8")
+            ai_signature = deepseek_client.request_signature(config.deepseek_model, config.deepseek_url, "", ())
+            generation_signature = hashlib.sha256(json.dumps(
+                {"base": ai_signature, "mode": "semantic", "prompt": "semantic-v2"}, sort_keys=True
+            ).encode("utf-8")).hexdigest()
+            (claimed.parent / "rewrite" / "staged.json").write_text(json.dumps({
+                "version": 1, "request_signature": generation_signature,
+                "text_sha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
+                "source_sha256": hashlib.sha256(claimed.read_bytes()).hexdigest(),
+                "semantic_review_complete": True,
+            }), encoding="utf-8")
+            webhook_key = hashlib.sha256(config.wechat_webhook_url.encode("utf-8")).hexdigest()
+            delivery_signature = hashlib.sha256((generation_signature + "\0" + hashlib.sha256(staged.read_bytes()).hexdigest()).encode("ascii")).hexdigest()
+            (claimed.parent / "rewrite" / f"webhook.{webhook_key}.sent").write_text(delivery_signature, encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=AssertionError("first pass reran")), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=AssertionError("review reran")), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            self.assertEqual(result.read_text(encoding="utf-8"), "安全正文。" * 10)
+
+    def test_existing_semantic_v2_unsent_stage_uses_revised_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            claimed = rewrite_processor.claim_source(source, config)
+            staged = claimed.parent / "rewrite" / "staged" / claimed.name
+            staged.parent.mkdir(parents=True)
+            staged.write_text("旧版正文。" * 10, encoding="utf-8")
+            ai_signature = deepseek_client.request_signature(config.deepseek_model, config.deepseek_url, "", ())
+            generation_signature = hashlib.sha256(json.dumps(
+                {"base": ai_signature, "mode": "semantic", "prompt": "semantic-v2"}, sort_keys=True
+            ).encode("utf-8")).hexdigest()
+            (claimed.parent / "rewrite" / "staged.json").write_text(json.dumps({
+                "version": 1, "request_signature": generation_signature,
+                "text_sha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
+                "source_sha256": hashlib.sha256(claimed.read_bytes()).hexdigest(),
+                "semantic_review_complete": True,
+            }), encoding="utf-8")
+            def review(**kwargs):
+                self.assertEqual(kwargs["current"], "原始正文。" * 10)
+                return semantic_compliance.SemanticResult("新版正文。" * 10, (), 1, 1)
+            with patch.object(rewrite_processor, "review_and_rewrite", side_effect=review) as revised, \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            revised.assert_called_once()
+            send.assert_called_once()
+            self.assertEqual(result.read_text(encoding="utf-8"), "新版正文。" * 10)
+
+    def test_semantic_staged_resume_after_webhook_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            reviewed = semantic_compliance.SemanticResult("安全正文。" * 10, (), 1, 0)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=reviewed) as review, \
+                 patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaises(RuntimeError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            with patch.object(rewrite_processor, "optimize_text", side_effect=AssertionError("first pass must be reused")), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=AssertionError("reviewed stage must be reused")), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            self.assertEqual(review.call_count, 1)
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(result.read_text(encoding="utf-8"), "安全正文。" * 10)
+
+    def test_semantic_staged_resume_rechecks_source_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            def review(**kwargs):
+                return semantic_compliance.SemanticResult(kwargs["original"], (), 1, 0)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=review), \
+                 patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaises(RuntimeError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            claimed.write_text("更改正文。" * 10, encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]) as first, \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=review) as reviewed, \
+                 patch.object(rewrite_processor, "send_file") as send:
+                result = rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            first.assert_not_called()
+            reviewed.assert_called_once()
+            send.assert_called_once()
+            self.assertEqual(result.read_text(encoding="utf-8"), "更改正文。" * 10)
+
+    def test_semantic_source_change_during_review_blocks_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            def review(**kwargs):
+                kwargs["checkpoint_dir"].parent.parent.joinpath("novel.txt").write_text("更改正文。" * 10, encoding="utf-8")
+                return semantic_compliance.SemanticResult("原始正文。" * 10, (), 1, 0)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=review), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaisesRegex(RuntimeError, "原文在语义复核期间改变"):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            self.assertEqual(len(rewrite_processor.recover_claimed_sources(config)), 1)
+
+    def test_semantic_mode_rejects_staged_without_review_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            reviewed = semantic_compliance.SemanticResult("安全正文。" * 10, (), 1, 0)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=reviewed), \
+                 patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
+                with self.assertRaises(RuntimeError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            metadata_path = claimed.parent / "rewrite" / "staged.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.pop("semantic_review_complete", None)
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", return_value=reviewed) as review, \
+                 patch.object(rewrite_processor, "send_file") as send:
+                rewrite_processor.process_file(claimed, config, logging.getLogger("test-semantic"))
+            self.assertEqual(review.call_count, 1)
+            self.assertEqual(send.call_count, 1)
+
+    def test_semantic_mode_stops_when_user_rules_change_during_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
+            rules_path = root / deepseek_client.RULES_FILE_NAME
+            rules_path.write_text("旧规则", encoding="utf-8")
+            source = config.input_dir / "novel.txt"
+            source.write_text("原始正文。" * 10, encoding="utf-8")
+            def review(**kwargs):
+                rules_path.write_text("新规则", encoding="utf-8")
+                return semantic_compliance.SemanticResult("安全正文。" * 10, (), 1, 0)
+            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs: kwargs["text"]), \
+                 patch.object(rewrite_processor, "review_and_rewrite", side_effect=review), \
+                 patch.object(rewrite_processor, "send_file") as send:
+                with self.assertRaises(deepseek_client.BannedRulesChangedError):
+                    rewrite_processor.process_file(source, config, logging.getLogger("test-semantic"))
+            send.assert_not_called()
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
 
     def test_configured_source_directory_uses_value_or_default(self):
         self.assertEqual(configured_source_dir("D:/小说待处理"), Path("D:/小说待处理"))
@@ -224,12 +3047,154 @@ class PipelineTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "裁剪失败"):
                     voice_monitor.process_file(text_path, config, synthesize=synthesize)
                 self.assertTrue(text_path.exists())
-                self.assertTrue(voice_monitor._valid_mp3(complete / "novel.mp3"))
+                self.assertFalse((complete / "novel.mp3").exists())
+                self.assertEqual(len(list((complete / ".voice-staging").glob("*.mp3"))), 2)
                 voice_monitor.process_file(text_path, config, synthesize=synthesize)
 
             self.assertEqual(len(synthesis_calls), 1)
             self.assertFalse(text_path.exists())
             self.assertTrue((complete / "novel.txt").is_file())
+
+    def test_trimmed_audio_recovers_after_crash_before_receipt_update(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            synth_calls = []
+            original_audio = self.valid_mp3_bytes()
+            trimmed_audio = self.valid_mp3_bytes() + self.valid_mp3_bytes()
+
+            async def synthesize(_text, output, _config):
+                synth_calls.append(True)
+                Path(output).write_bytes(original_audio)
+                return "edge"
+
+            def trim_then_crash(path):
+                Path(path).write_bytes(trimmed_audio)
+                raise RuntimeError("crashed after trimming")
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", side_effect=trim_then_crash):
+                with self.assertRaisesRegex(RuntimeError, "crashed after trimming"):
+                    voice_monitor.process_file(source, config, synthesize=synthesize)
+            def successful_trim(path):
+                Path(path).write_bytes(trimmed_audio)
+                return 2100.0, True
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", side_effect=successful_trim):
+                result = voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(synth_calls, [True])
+            self.assertEqual(result.read_bytes(), trimmed_audio)
+
+    def test_external_mp3_appearing_during_trim_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            final_audio = complete / "novel.mp3"
+            calls = []
+
+            async def synthesize(_text, output, _config):
+                calls.append(True)
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            def occupy_while_trimming(path):
+                self.assertNotEqual(Path(path), final_audio)
+                final_audio.write_bytes(b"external owner")
+                return 2100.0, True
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", side_effect=occupy_while_trimming):
+                with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                    voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(final_audio.read_bytes(), b"external owner")
+            self.assertTrue(source.exists())
+            final_audio.unlink()
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(2100.0, True)):
+                result = voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(result.name, "novel.mp3")
+            self.assertEqual(calls, [True])
+
+    def test_voice_uses_no_overwrite_rename_when_hardlinks_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete), "keep_text_after_voice": False})
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with patch.object(voice_monitor.os, "link", side_effect=OSError("hard links unavailable")), \
+                 patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                result = voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertTrue(result.is_file())
+            self.assertEqual(result.name, "novel.mp3")
+            self.assertFalse(source.exists())
+
+    def test_default_voice_flow_publishes_txt_without_hardlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with patch.object(voice_monitor.os, "link", side_effect=OSError("hard links unavailable")), \
+                 patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                result = voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertTrue(result.is_file())
+            self.assertEqual((complete / "novel.txt").read_text(encoding="utf-8"), "正文")
+            self.assertFalse(source.exists())
+
+    def test_partial_valid_audio_before_synthesis_failure_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            calls = []
+            full_audio = self.valid_mp3_bytes() * 3
+
+            async def synthesize(_text, output, _config):
+                calls.append(True)
+                Path(output).write_bytes(self.valid_mp3_bytes() if len(calls) == 1 else full_audio)
+                if len(calls) == 1:
+                    raise RuntimeError("synthesis interrupted")
+                return "edge"
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                with self.assertRaisesRegex(RuntimeError, "synthesis interrupted"):
+                    voice_monitor.process_file(source, config, synthesize=synthesize)
+                result = voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(calls, [True, True])
+            self.assertEqual(result.read_bytes(), full_audio)
 
     def test_edge_stream_rejects_empty_or_stalled_audio_and_cleans_temp_file(self):
         class EmptyCommunicate:
@@ -352,18 +3317,18 @@ class PipelineTests(unittest.TestCase):
                 Path(output).write_bytes(self.valid_mp3_bytes())
                 return "edge"
 
-            real_move = voice_monitor.shutil.move
+            real_link = voice_monitor.os.link
             moved_once = []
 
-            def move_then_edit(src, dst):
-                result = real_move(src, dst)
-                if Path(dst).parent == complete and not moved_once:
+            def link_then_edit(src, dst):
+                result = real_link(src, dst)
+                if Path(dst) == complete / "novel.txt" and not moved_once:
                     moved_once.append(True)
                     (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("抓奸=揭露\n", encoding="utf-8")
                 return result
 
             processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
-            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)), patch.object(voice_monitor.shutil, "move", side_effect=move_then_edit):
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)), patch.object(voice_monitor.os, "link", side_effect=link_then_edit):
                 self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
             self.assertEqual((failed / "novel.txt").read_text(encoding="utf-8"), "众人抓奸后离开。")
             self.assertEqual((failed / "novel.mp3").read_bytes(), self.valid_mp3_bytes())
@@ -386,18 +3351,18 @@ class PipelineTests(unittest.TestCase):
                 Path(output).write_bytes(self.valid_mp3_bytes())
                 return "edge"
 
-            real_move = voice_monitor.shutil.move
+            real_link = voice_monitor.os.link
             moved_once = []
 
-            def move_then_corrupt(src, dst):
-                result = real_move(src, dst)
-                if Path(dst).parent == complete and not moved_once:
+            def link_then_corrupt(src, dst):
+                result = real_link(src, dst)
+                if Path(dst) == complete / "novel.txt" and not moved_once:
                     moved_once.append(True)
                     (rules / deepseek_client.BANNED_TERMS_FILE_NAME).write_bytes(b"\xff\xfe")
                 return result
 
             processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
-            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)), patch.object(voice_monitor.shutil, "move", side_effect=move_then_corrupt):
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)), patch.object(voice_monitor.os, "link", side_effect=link_then_corrupt):
                 self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
             self.assertEqual(source.read_text(encoding="utf-8"), "众人抓奸后离开。")
             self.assertEqual(list(complete.glob("*.txt")), [])
@@ -962,6 +3927,255 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(list(config.failed_dir.iterdir()), [])
             self.assertEqual(service.retry_queue[source].attempts, 0)
 
+    def test_rewrite_waits_for_same_title_in_voice_queue_then_resumes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            source = config.input_dir / "小说.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            occupied = config.output_dir / f"小说.__rw_{'a' * 32}.txt"
+            occupied.write_text("前一本正文", encoding="utf-8")
+            marker = config.output_dir / ".rewrite-queue-names" / f"{'a' * 32}.json"
+            marker.parent.mkdir()
+            marker.write_text(json.dumps({"queue_name": occupied.name, "original_name": "小说.txt"}), encoding="utf-8")
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-name-wait"), lambda *_: None, lambda *_: None
+            )
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
+                 patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
+                 patch.object(rewrite_processor, "send_file"):
+                service.process_once(source)
+                self.assertTrue(source.exists())
+                self.assertEqual(list((config.input_dir / ".rewrite-processing").glob("*/*.txt")), [])
+                self.assertNotIn(source, service.retry_queue)
+                occupied.unlink()
+                service.process_once(source)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(len(list(config.output_dir.glob("小说.__rw_*.txt"))), 1)
+
+    def test_rewrite_waits_for_same_title_in_configured_final_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            complete = root / "custom-complete"
+            complete.mkdir()
+            source = config.input_dir / "小说.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            existing = complete / "小说.mp3"
+            existing.write_bytes(b"older audio")
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-final-output-wait"), lambda *_: None, lambda *_: None
+            )
+            service.voice_output_dir = complete
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
+                 patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
+                 patch.object(rewrite_processor, "send_file"):
+                service.process_once(source)
+                self.assertTrue(source.exists())
+                self.assertEqual(existing.read_bytes(), b"older audio")
+                self.assertNotIn(source, service.retry_queue)
+                existing.unlink()
+                service.process_once(source)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(len(list(config.output_dir.glob("小说.__rw_*.txt"))), 1)
+
+    def test_claimed_rewrite_waits_for_same_title_without_spending_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            source = config.input_dir / "小说.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            claimed = rewrite_processor.claim_source(source, config)
+            complete = root / "complete"
+            complete.mkdir()
+            occupied = complete / "小说.mp3"
+            occupied.write_bytes(b"older audio")
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-claimed-name-wait"), lambda *_: None, lambda *_: None,
+                voice_output_dir=complete,
+            )
+            with patch.object(rewrite_monitor, "process_file") as process:
+                service.process_once(claimed)
+            process.assert_not_called()
+            self.assertTrue(claimed.exists())
+            self.assertNotIn(claimed, service.retry_queue)
+            occupied.unlink()
+            with patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
+                 patch.object(rewrite_processor, "send_file"):
+                service.process_once(claimed)
+            self.assertFalse(claimed.exists())
+
+    def test_publish_receipt_alone_does_not_bypass_completed_name_wait(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            source = config.input_dir / "小说.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            claimed = rewrite_processor.claim_source(source, config)
+            job_id = claimed.parent.name
+            target = config.output_dir / f"小说.__rw_{job_id}.txt"
+            (claimed.parent / "publish.json").write_text(json.dumps({
+                "job_id": job_id, "target_path": str(target), "text_sha256": "0" * 64,
+            }), encoding="utf-8")
+            complete = root / "complete"
+            complete.mkdir()
+            occupied = complete / "小说.mp3"
+            occupied.write_bytes(b"external")
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-publish-marker-wait"), lambda *_: None, lambda *_: None,
+                voice_output_dir=complete,
+            )
+            with patch.object(rewrite_monitor, "process_file") as process:
+                service.process_once(claimed)
+            process.assert_not_called()
+            self.assertTrue(claimed.exists())
+            self.assertNotIn(claimed, service.retry_queue)
+
+    def test_title_claim_guard_uses_same_identity_for_legacy_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            queue = Path(temporary)
+            self.assertFalse(same_title("小说-20261014-224233-1", queue / "小说.txt"))
+            with title_claim_guard(queue, "小说.txt") as first:
+                self.assertTrue(first)
+                with title_claim_guard(queue, "小说-20261014-224233-1.txt") as second:
+                    self.assertFalse(second)
+
+    def test_rewrite_publication_does_not_replace_queue_file_created_during_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir, queue = root / "job", root / "queue"
+            job_dir.mkdir()
+            queue.mkdir()
+            staged = job_dir / "staged.txt"
+            staged.write_text("新版", encoding="utf-8")
+            job_id = "a" * 32
+            target = queue / f"小说.__rw_{job_id}.txt"
+            real_copy = rewrite_processor.shutil.copyfile
+
+            def occupy_after_copy(source, destination):
+                result = real_copy(source, destination)
+                target.write_text("外部文件", encoding="utf-8")
+                return result
+
+            with patch.object(rewrite_processor.shutil, "copyfile", side_effect=occupy_after_copy):
+                with self.assertRaisesRegex(RuntimeError, "占用"):
+                    rewrite_processor._publish_staged(staged, job_dir, queue, "小说.txt", job_id)
+            self.assertEqual(target.read_text(encoding="utf-8"), "外部文件")
+
+    def test_relative_voice_output_config_uses_project_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            path = project / "config.json"
+            path.write_text(json.dumps({"input_dir": "queue", "output_dir": "complete"}), encoding="utf-8")
+            voice = voice_monitor.load_config(path)
+            self.assertEqual(Path(voice["output_dir"]), (project / "complete").resolve())
+            self.assertEqual(Path(voice["input_dir"]), (project / "queue").resolve())
+
+    def test_literal_internal_looking_title_is_preserved_and_not_confused_with_base(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            job_id = "a" * 32
+            name = f"小说.__rw_{job_id}"
+            source = queue / f"{name}.txt"
+            source.write_text("正文", encoding="utf-8")
+            (complete / "小说.mp3").write_bytes(b"other title")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            self.assertFalse(same_title(name, complete / "小说.mp3"))
+            self.assertEqual(voice_monitor.public_queue_name(source, config), source.name)
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                result = voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(result.name, f"{name}.mp3")
+            self.assertEqual((complete / f"{name}.txt").read_text(encoding="utf-8"), "正文")
+            self.assertEqual((complete / "小说.mp3").read_bytes(), b"other title")
+
+    def test_unmarked_legacy_looking_queue_name_is_kept_literal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            old_id = "a" * 32
+            old = queue / f"小说.__rw_{old_id}.txt"
+            old.write_text("旧正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            self.assertEqual(voice_monitor.public_queue_name(old, config), old.name)
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                result = voice_monitor.process_file(old, config, synthesize=synthesize)
+            self.assertEqual(result.name, f"小说.__rw_{old_id}.mp3")
+
+    def test_rewrite_and_voice_keep_literal_internal_looking_original_title(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            complete = root / "complete"
+            complete.mkdir()
+            name = f"小说.__rw_{'a' * 32}"
+            source = config.input_dir / f"{name}.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            (complete / "小说.mp3").write_bytes(b"unrelated")
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-literal-internal-name"), lambda *_: None, lambda *_: None,
+                voice_output_dir=complete,
+            )
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
+                 patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
+                 patch.object(rewrite_processor, "send_file"):
+                service.process_once(source)
+            queued = next(config.output_dir.glob("*.txt"))
+            voice_config = voice_monitor.default_config()
+            voice_config.update({"input_dir": str(config.output_dir), "output_dir": str(complete)})
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                result = voice_monitor.process_file(queued, voice_config, synthesize=synthesize)
+            self.assertEqual(result.name, f"{name}.mp3")
+            self.assertTrue((complete / f"{name}.txt").is_file())
+
+    def test_rewrite_uses_current_voice_output_directory_after_setting_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            first = root / "first-complete"
+            second = root / "second-complete"
+            first.mkdir()
+            second.mkdir()
+            (first / "小说.mp3").write_bytes(b"old")
+            source = config.input_dir / "小说.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            current_output = [first]
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-configured-output-change"), lambda *_: None, lambda *_: None,
+                voice_output_dir=lambda: current_output[0],
+            )
+            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
+                 patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
+                 patch.object(rewrite_processor, "send_file"):
+                service.process_once(source)
+                self.assertTrue(source.exists())
+                current_output[0] = second
+                service.process_once(source)
+            self.assertFalse(source.exists())
+
     def test_cli_invalid_banned_rules_leave_source_and_retry_budget_untouched(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -976,6 +4190,31 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(source.read_text(encoding="utf-8"), "原始小说")
             self.assertEqual(list(config.failed_dir.iterdir()), [])
             self.assertEqual(queue[source].attempts, 0)
+
+    def test_cli_rewrite_waits_for_same_title_in_configured_voice_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            rewrite_root = project / "改写"
+            rewrite_root.mkdir()
+            config = self.rewrite_config(rewrite_root)
+            complete = project / "custom-complete"
+            complete.mkdir()
+            (project / "config.json").write_text(json.dumps({"output_dir": str(complete)}), encoding="utf-8")
+            existing = complete / "小说.mp3"
+            existing.write_bytes(b"old audio")
+            source = config.input_dir / "小说.txt"
+            source.write_text("原始正文", encoding="utf-8")
+            queue = {}
+            stats = rewrite_runner.MonitorStats(started_at=datetime.now())
+            with patch.object(rewrite_runner, "wait_until_stable", return_value=True), \
+                 patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
+                 patch.object(rewrite_processor, "send_file"):
+                rewrite_runner._attempt(source, config, logging.getLogger("test-cli-name-wait"), queue, stats)
+                self.assertTrue(source.exists())
+                self.assertNotIn(source, queue)
+                existing.unlink()
+                rewrite_runner._attempt(source, config, logging.getLogger("test-cli-name-wait"), queue, stats)
+            self.assertFalse(source.exists())
 
     def test_invalid_banned_rules_cannot_overwrite_saved_gui_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1000,7 +4239,7 @@ class PipelineTests(unittest.TestCase):
                 result = rewrite_processor.process_file(source, config, logging.getLogger("test"))
 
             self.assertEqual(optimize.call_count, 1)
-            self.assertEqual(result.read_text(encoding="utf-8"), "第一章 起点\n婚前变心，又去揭露。")
+            self.assertEqual(result.read_text(encoding="utf-8"), "婚前变心，又去揭露。")
             self.assertFalse(source.exists())
 
     def test_longer_fixed_replacement_does_not_fail_ai_length_check(self):
@@ -1348,7 +4587,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(outputs), 2)
             self.assertEqual(len({path.name for path in outputs}), 2)
 
-    def test_40k_book_runs_through_rewrite_and_voice_pipeline(self):
+    def test_40k_input_is_trimmed_to_7000_before_rewrite_and_voice(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = self.rewrite_config(root)
@@ -1397,7 +4636,12 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(voice_monitor.process_once(voice_config, processor=processor, stable_checker=lambda *_: True), 1)
             completed_text = complete / "长篇小说.txt"
             completed_audio = complete / "长篇小说.mp3"
-            self.assertEqual(completed_text.read_text(encoding="utf-8"), text)
+            final_text=completed_text.read_text(encoding="utf-8")
+            self.assertEqual(re.sub(r'\s','',final_text),re.sub(r'\s','','\n'.join(paragraphs[1:]))[:7000])
+            self.assertNotIn('第一章',final_text)
+            backups=list((config.root/'原文备份').glob('*/原文/长篇小说.txt'))
+            self.assertEqual(len(backups),1)
+            self.assertEqual(backups[0].read_text(encoding='utf-8'),text)
             self.assertTrue(voice_monitor._valid_mp3(completed_audio))
             self.assertFalse(queued.exists())
             self.assertEqual(rewrite_processor.recover_claimed_sources(config), [])
@@ -1511,6 +4755,9 @@ class PipelineTests(unittest.TestCase):
             job_id = "a" * 32
             source = queue / f"小说.__rw_{job_id}.txt"
             source.write_text("正文", encoding="utf-8")
+            marker = queue / ".rewrite-queue-names" / f"{job_id}.json"
+            marker.parent.mkdir()
+            marker.write_text(json.dumps({"queue_name": source.name, "original_name": "小说.txt"}), encoding="utf-8")
             config = voice_monitor.default_config()
             config.update({"input_dir": str(queue), "output_dir": str(complete)})
             claimed = voice_monitor.claim_text_file(source, config)
@@ -1518,25 +4765,126 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(json.loads(handoff.read_text(encoding="utf-8"))["job_id"], job_id)
             released = voice_monitor.release_claim(claimed, config)
             self.assertTrue(handoff.exists())
-            self.assertEqual(voice_monitor.public_queue_name(released), "小说.txt")
+            self.assertEqual(voice_monitor.public_queue_name(released, config), "小说.txt")
             audio, completed_text = voice_monitor.completion_paths_for(released, config)
             self.assertEqual(audio.name, "小说.mp3")
             self.assertEqual(completed_text.name, "小说.txt")
 
-    def test_release_collision_keeps_internal_job_suffix_parseable(self):
+    def test_voice_waits_for_existing_mp3_then_uses_original_txt_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说-第1章.txt"
+            source.write_text("新的正文", encoding="utf-8")
+            existing = complete / "小说-第1章.mp3"
+            existing.write_bytes(b"older audio")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            calls = []
+
+            async def synthesize(_text, output, _config):
+                calls.append(Path(output))
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
+            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+            self.assertEqual(existing.read_bytes(), b"older audio")
+            self.assertTrue(source.exists())
+            self.assertEqual(calls, [])
+            self.assertEqual(voice_monitor.RETRY_STATE.get(str(source)), None)
+
+            existing.unlink()
+            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 1)
+            self.assertEqual([path.name for path in complete.glob("*.mp3")], ["小说-第1章.mp3"])
+            self.assertEqual((complete / "小说-第1章.txt").read_text(encoding="utf-8"), "新的正文")
+
+    def test_voice_waits_for_legacy_dated_output_and_existing_completed_txt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("新正文", encoding="utf-8")
+            old_audio = complete / "小说-20261014-224233-1.mp3"
+            old_audio.write_bytes(b"existing")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
+            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+            self.assertTrue(source.exists())
+            old_audio.unlink()
+            old_text = complete / "小说.txt"
+            old_text.write_text("旧正文", encoding="utf-8")
+            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
+            self.assertEqual(old_text.read_text(encoding="utf-8"), "旧正文")
+            old_text.unlink()
+            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 1)
+            self.assertEqual(sorted(path.name for path in complete.iterdir()), ["小说.mp3", "小说.txt"])
+
+    def test_unreadable_waiting_voice_file_does_not_stop_other_titles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            broken = queue / "a.txt"
+            healthy = queue / "b.txt"
+            broken.write_text("正文", encoding="utf-8")
+            healthy.write_text("正文", encoding="utf-8")
+            (complete / "a.mp3").write_bytes(b"existing")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            real_read = voice_monitor.read_text
+
+            def read(path):
+                if Path(path).name == "a.txt":
+                    raise FileNotFoundError("file changed during scan")
+                return real_read(path)
+
+            def processor(path, _config):
+                Path(path).unlink()
+                return True
+
+            with patch.object(voice_monitor, "read_text", side_effect=read):
+                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 1)
+            self.assertTrue(broken.exists())
+            self.assertFalse(healthy.exists())
+
+    def test_release_collision_waits_without_changing_original_title(self):
         with tempfile.TemporaryDirectory() as temporary:
             queue = Path(temporary) / "queue"
             queue.mkdir()
             job_id = "b" * 32
             source = queue / f"小说.__rw_{job_id}.txt"
             source.write_text("正文", encoding="utf-8")
+            marker = queue / ".rewrite-queue-names" / f"{job_id}.json"
+            marker.parent.mkdir()
+            marker.write_text(json.dumps({"queue_name": source.name, "original_name": "小说.txt"}), encoding="utf-8")
             config = voice_monitor.default_config()
             config.update({"input_dir": str(queue), "output_dir": str(Path(temporary) / "complete")})
             claimed = voice_monitor.claim_text_file(source, config)
             source.write_text("同名占位", encoding="utf-8")
+            waiting = voice_monitor.release_claim(claimed, config)
+            self.assertEqual(waiting, claimed)
+            self.assertTrue(claimed.exists())
+            self.assertEqual(source.read_text(encoding="utf-8"), "同名占位")
+            source.unlink()
             released = voice_monitor.release_claim(claimed, config)
+            self.assertEqual(released, source)
             self.assertEqual(voice_monitor.rewrite_job_id(released), job_id)
-            self.assertNotIn(".__rw_", voice_monitor.public_queue_name(released))
+            self.assertEqual(voice_monitor.public_queue_name(released, config), "小说.txt")
 
     def test_text_move_retry_does_not_generate_duplicate_mp3(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1556,22 +4904,240 @@ class PipelineTests(unittest.TestCase):
                 Path(output).write_bytes(self.valid_mp3_bytes())
                 return "edge"
 
-            real_move = voice_monitor.shutil.move
+            real_link = voice_monitor.os.link
+            real_rename = voice_monitor.os.rename
             move_calls = []
 
-            def flaky_move(source_path, target_path):
-                move_calls.append(True)
-                if len(move_calls) == 1:
-                    raise OSError("move failed")
-                return real_move(source_path, target_path)
+            def flaky_link(source_path, target_path):
+                if Path(target_path).suffix.lower() == ".txt":
+                    move_calls.append(True)
+                    if len(move_calls) == 1:
+                        raise OSError("text publication failed")
+                return real_link(source_path, target_path)
 
-            with patch.object(voice_monitor.shutil, "move", side_effect=flaky_move):
+            def flaky_rename(source_path, target_path):
+                if Path(target_path).suffix.lower() == ".txt":
+                    raise OSError("text publication failed")
+                return real_rename(source_path, target_path)
+
+            with patch.object(voice_monitor.os, "link", side_effect=flaky_link), \
+                 patch.object(voice_monitor.os, "rename", side_effect=flaky_rename):
                 with self.assertRaises(OSError):
                     voice_monitor.process_file(source, config, synthesize=audio)
                 result = voice_monitor.process_file(source, config, synthesize=audio)
             self.assertEqual(len(synthesize_calls), 1)
             self.assertTrue(result.exists())
             self.assertEqual(len(list(complete.glob("*.mp3"))), 1)
+
+    def test_own_legacy_audio_receipt_finishes_with_original_txt_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("正文", encoding="utf-8")
+            old_audio = complete / "小说-20261014-224233-1.mp3"
+            old_audio.write_bytes(self.valid_mp3_bytes())
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            receipt_path = voice_monitor._receipt_path(source, "正文", config)
+            voice_monitor._save_receipt(receipt_path, {
+                "output_path": str(old_audio),
+                "completed_text_path": str(complete / "小说-20261014-224233-1.txt"),
+                "audio_ready": True,
+                "audio_sha256": voice_monitor.audio_sha256(old_audio),
+                "engine": "edge",
+            })
+
+            async def unexpected_synthesis(*_args):
+                self.fail("已有有效音频不应再次调用配音")
+
+            result = voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
+            self.assertEqual(result.name, "小说.mp3")
+            self.assertFalse(old_audio.exists())
+            self.assertTrue((complete / "小说.mp3").exists())
+            self.assertTrue((complete / "小说.txt").exists())
+
+    def test_changed_legacy_audio_blocks_migration_without_touching_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("正文", encoding="utf-8")
+            old_audio = complete / "小说-20261014-224233-1.mp3"
+            owned_audio = self.valid_mp3_bytes()
+            old_audio.write_bytes(owned_audio)
+            expected_hash = voice_monitor.audio_sha256(old_audio)
+            old_audio.write_bytes(owned_audio + self.valid_mp3_bytes())
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            receipt_path = voice_monitor._receipt_path(source, "正文", config)
+            voice_monitor._save_receipt(receipt_path, {
+                "output_path": str(old_audio),
+                "completed_text_path": str(complete / "小说-20261014-224233-1.txt"),
+                "audio_ready": True, "audio_sha256": expected_hash,
+            })
+            with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                voice_monitor.process_file(source, config)
+            self.assertEqual(old_audio.read_bytes(), owned_audio + self.valid_mp3_bytes())
+            self.assertFalse((complete / "小说.mp3").exists())
+            self.assertTrue(source.exists())
+
+    def test_relative_receipt_path_for_same_audio_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, complete = root / "queue", root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("正文", encoding="utf-8")
+            audio = complete / "小说.mp3"
+            audio.write_bytes(self.valid_mp3_bytes())
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            receipt_path = voice_monitor._receipt_path(source, "正文", config)
+            relative_audio = Path(os.path.relpath(audio, Path.cwd()))
+            relative_text = Path(os.path.relpath(complete / "小说.txt", Path.cwd()))
+            voice_monitor._save_receipt(receipt_path, {
+                "output_path": str(relative_audio), "completed_text_path": str(relative_text),
+                "audio_ready": True, "audio_sha256": voice_monitor.audio_sha256(audio),
+            })
+            async def unexpected_synthesis(*_args):
+                self.fail("已有音频不应重合成")
+            result = voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
+            self.assertEqual(result, audio)
+            self.assertTrue(audio.is_file())
+            self.assertFalse(source.exists())
+
+    def test_own_legacy_receipt_recovers_after_audio_copy_before_receipt_save(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("正文", encoding="utf-8")
+            old_audio = complete / "小说-20261014-224233-1.mp3"
+            new_audio = complete / "小说.mp3"
+            old_audio.write_bytes(self.valid_mp3_bytes())
+            new_audio.write_bytes(old_audio.read_bytes())
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            voice_monitor._save_receipt(voice_monitor._receipt_path(source, "正文", config), {
+                "output_path": str(old_audio),
+                "completed_text_path": str(complete / "小说-20261014-224233-1.txt"),
+                "audio_ready": True,
+                "audio_sha256": voice_monitor.audio_sha256(old_audio),
+                "engine": "edge",
+            })
+
+            async def unexpected_synthesis(*_args):
+                self.fail("恢复已复制音频时不应再次合成")
+
+            result = voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
+            self.assertEqual(result, new_audio)
+            self.assertTrue(new_audio.exists())
+            self.assertFalse(old_audio.exists())
+
+    def test_voice_does_not_overwrite_mp3_created_during_synthesis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+            final_audio = complete / "小说.mp3"
+
+            async def synthesize(_text, output, _config):
+                final_audio.write_bytes(b"external owner")
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(final_audio.read_bytes(), b"external owner")
+            self.assertTrue(source.exists())
+            self.assertEqual(sorted(path.name for path in complete.glob("*.mp3")), ["小说.mp3"])
+            final_audio.unlink()
+
+            async def unexpected_synthesis(*_args):
+                self.fail("同名文件移走后应复用已合成的音频")
+
+            result = voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
+            self.assertEqual(result.name, "小说.mp3")
+            self.assertTrue(result.exists())
+
+    def test_voice_does_not_overwrite_txt_created_during_synthesis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("新正文", encoding="utf-8")
+            final_text = complete / "小说.txt"
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+
+            async def synthesize(_text, output, _config):
+                final_text.write_text("外部文件", encoding="utf-8")
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertEqual(final_text.read_text(encoding="utf-8"), "外部文件")
+            self.assertTrue(source.exists())
+            final_text.unlink()
+
+            async def unexpected_synthesis(*_args):
+                self.fail("TXT 移走后应复用已生成的 MP3")
+
+            voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
+            self.assertEqual(final_text.read_text(encoding="utf-8"), "新正文")
+
+    def test_identical_external_txt_after_staging_still_blocks_voice_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            complete = root / "complete"
+            queue.mkdir()
+            complete.mkdir()
+            source = queue / "小说.txt"
+            source.write_text("正文", encoding="utf-8")
+            final_text = complete / "小说.txt"
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(complete)})
+
+            async def synthesize(_text, output, _config):
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                return "edge"
+
+            real_link = voice_monitor.os.link
+
+            def occupy_during_link(src, dst):
+                if Path(dst) == final_text:
+                    final_text.write_text("正文", encoding="utf-8")
+                return real_link(src, dst)
+
+            with patch.object(voice_monitor.os, "link", side_effect=occupy_during_link):
+                with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                    voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertTrue(source.exists())
+            self.assertEqual(final_text.read_text(encoding="utf-8"), "正文")
+            with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                voice_monitor.process_file(source, config, synthesize=synthesize)
+            self.assertTrue(source.exists())
 
     def test_receipt_moves_ready_audio_when_output_directory_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1592,17 +5158,63 @@ class PipelineTests(unittest.TestCase):
                 Path(output).write_bytes(self.valid_mp3_bytes())
                 return "edge"
 
-            real_move = voice_monitor.shutil.move
-            with patch.object(voice_monitor.shutil, "move", side_effect=OSError("move failed")):
+            real_link = voice_monitor.os.link
+            real_rename = voice_monitor.os.rename
+
+            def fail_text_link(src, dst):
+                if Path(dst).suffix.lower() == ".txt":
+                    raise OSError("text publication failed")
+                return real_link(src, dst)
+
+            def fail_text_rename(src, dst):
+                if Path(dst).suffix.lower() == ".txt":
+                    raise OSError("text publication failed")
+                return real_rename(src, dst)
+
+            with patch.object(voice_monitor.os, "link", side_effect=fail_text_link), \
+                 patch.object(voice_monitor.os, "rename", side_effect=fail_text_rename):
                 with self.assertRaises(OSError):
                     voice_monitor.process_file(source, config, synthesize=audio)
             config["output_dir"] = str(second_output)
-            with patch.object(voice_monitor.shutil, "move", side_effect=real_move):
-                result = voice_monitor.process_file(source, config, synthesize=audio)
+            result = voice_monitor.process_file(source, config, synthesize=audio)
             self.assertEqual(synthesize_calls, [True])
             self.assertEqual(result.parent, second_output)
             self.assertTrue(result.exists())
             self.assertEqual(list(first_output.glob("*.mp3")), [])
+
+    def test_staged_audio_follows_output_directory_change_without_resynthesis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue, first, second = root / "queue", root / "first", root / "second"
+            for directory in (queue, first, second):
+                directory.mkdir()
+            source = queue / "novel.txt"
+            source.write_text("正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(first)})
+            external = first / "novel.mp3"
+            calls = []
+
+            async def synthesize(_text, output, _config):
+                calls.append(True)
+                Path(output).write_bytes(self.valid_mp3_bytes())
+                external.write_bytes(b"external")
+                return "edge"
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                with self.assertRaises(voice_monitor.VoiceNameOccupiedError):
+                    voice_monitor.process_file(source, config, synthesize=synthesize)
+            external.unlink()
+            config["output_dir"] = str(second)
+
+            async def unexpected_synthesis(*_args):
+                self.fail("已合成音频应从旧暂存区迁移")
+
+            with patch.object(voice_monitor, "limit_completed_mp3_duration", return_value=(1.0, False)):
+                result = voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
+            self.assertEqual(calls, [True])
+            self.assertEqual(result, second / "novel.mp3")
+            self.assertFalse(source.exists())
 
     def test_transient_voice_failure_never_becomes_terminal_failure(self):
         with tempfile.TemporaryDirectory() as temporary:

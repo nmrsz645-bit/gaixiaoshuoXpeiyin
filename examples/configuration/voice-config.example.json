@@ -1,0 +1,21 @@
+{
+  "input_dir": "已改完成",
+  "output_dir": "完成",
+  "engine": "edge",
+  "voice": "zh-CN-XiaoxiaoNeural",
+  "rate": "+0%",
+  "pitch": "+0Hz",
+  "volume": "+0%",
+  "use_random_voice": false,
+  "random_voices": [],
+  "extensions": [
+    ".txt"
+  ],
+  "stable_seconds": 15,
+  "poll_seconds": 5,
+  "keep_text_after_voice": true,
+  "source_after_success": "move_to_output",
+  "aliyun_appkey": "",
+  "aliyun_access_key_id_protected": "",
+  "aliyun_access_key_secret_protected": ""
+}

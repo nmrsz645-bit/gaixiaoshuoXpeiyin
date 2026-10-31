@@ -1,0 +1,12 @@
+{
+  "outputDir": "../已改完成",
+  "failedDir": "../改写失败",
+  "logDir": "logs",
+  "stableSeconds": 15,
+  "retryIntervalMinutes": 20,
+  "maxRetries": 3,
+  "deepseekModel": "deepseek-v4-flash",
+  "maxRequestChars": 8000,
+  "requestTimeoutSeconds": 300,
+  "semanticComplianceEnabled": false
+}

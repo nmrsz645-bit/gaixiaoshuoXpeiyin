@@ -8,8 +8,9 @@ from pathlib import Path
 
 from .config import AppConfig
 from .deepseek_client import BannedRuleConfigError, load_banned_rules
-from .file_utils import is_txt_file, move_to_failed, wait_until_stable
+from .file_utils import configured_voice_output_dir, is_txt_file, move_to_failed, rewrite_name_conflict, title_claim_guard, wait_until_stable
 from .processor import BannedTermError, claim_source, discard_job, is_claimed_source, load_retry_state, process_file, recover_claimed_sources, save_retry_state
+from .semantic_compliance import SemanticTransientError
 from .status import MonitorStats
 
 
@@ -21,6 +22,8 @@ class RetryItem:
 
 
 def is_transient_error(error: Exception) -> bool:
+    if isinstance(error, SemanticTransientError):
+        return True
     if isinstance(error, BannedTermError):
         return False
     text = str(error).lower()
@@ -64,9 +67,25 @@ def _attempt(
             if not wait_until_stable(path, config.stable_seconds):
                 logger.warning("文件消失或无法稳定: %s", path)
                 return
-            try:
-                path = claim_source(path, config)
-            except FileNotFoundError:
+            with title_claim_guard(config.input_dir, path.name) as acquired:
+                if not acquired:
+                    return
+                conflict = rewrite_name_conflict(
+                    path, config.input_dir, config.output_dir, configured_voice_output_dir(config.root)
+                )
+                if conflict:
+                    logger.debug("同名文件仍在，改写等待：%s（占用：%s）", path.name, conflict)
+                    return
+                try:
+                    path = claim_source(path, config)
+                except FileNotFoundError:
+                    return
+        else:
+            conflict = rewrite_name_conflict(
+                path, config.input_dir, config.output_dir, configured_voice_output_dir(config.root)
+            )
+            if conflict:
+                logger.debug("同名文件仍在，改写等待：%s（占用：%s）", path.name, conflict)
                 return
         stats.mark_started(path.name)
         _log_status(config, logger, stats)

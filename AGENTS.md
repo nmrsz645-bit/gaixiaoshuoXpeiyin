@@ -1,19 +1,10 @@
-# 项目接手约定
+# 项目维护约定
 
-1. 先完整阅读 `TIMEOFF.md`、`README.md`，再查看 `git status --short`。
-2. 权威源码仅为本项目根目录和 `novel_monitor/`；不要修改 `E:\自动化\改小说` 旧项目，也不要把 `发布版-*`、`发布候选-*`、`隔离验证-*` 当作源码。
-3. 不得读取、提交、复制、覆盖或删除用户配置、密钥、Webhook、规则、小说、音频、日志、统计、回执、失败队列或输出目录。它们均由 `.gitignore` 排除。
-4. 任何功能改动先完成离线测试；涉及真实接口、构建、OSS 发布、更新清单或通知用户，须获得用户明确授权。
-5. 正式发布必须使用新版本号和新隔离目录，递归审计包内容，真实验证升级/回滚、`app.previous`、用户数据保持和公网哈希回读；不得覆盖既有发布包或同版本清单。
-6. 当前线上版本为 `1.0.15`。其新增规则：只对新生成、超过 59 分钟的 MP3 保留前 35 分钟；历史成品不回头处理。
-
-## 必做检查
-
-```powershell
-python -m py_compile unified_app.py voice_monitor.py test_pipeline.py
-python -m unittest test_pipeline.py
-```
-
-当前完整回归基线为 66 项测试通过。其他具体证据、已知边界和下一步以 `TIMEOFF.md` 为准。
-
-`运行回归测试.bat` 与 `.github/workflows/offline-regression.yml` 只运行离线测试。不要把真实接口、OSS 发布或收费配音加入 CI。
+1. 先读 README.md、HANDOFF.md、docs/releases/2026-10-31-github-verification.md，再核对 git status、分支、HEAD 和远端。当前本分支为 1.0.30；不要用旧 TIMEOFF 历史路径判断源码位置。
+2. 权威源码是当前 Git checkout 根目录、novel_monitor/ 和 tools/。发布包、安装目录、业务目录、历史 build/验证副本均不是开发源。
+3. 保护用户配置、Key、Webhook、原文/备份、TXT/MP3、日志、队列/处理中、统计和回执；不清登录、不清锁、不重置真实任务、不覆盖未提交改动。同名文件等待，不能改名绕过保护。
+4. 新功能或修复先隔离复现和离线回归；有真实接口/任务/发送/恢复/发布副作用时，依据当前明确授权边界执行，不复用历史授权。GitHub 发布不授权 OSS/更新清单/下载站变更。
+5. 正式版 1.0.30 与 1.0.31-beta 测试分支保持区分。保留仓库可见性，不将私有测试源码擅自公开；正常推送，不强推，不覆盖已有标签/Release/包。
+6. 只提交完整源码、安全模板和脱敏说明。审查当前文件及本次新增历史，禁止密钥、个人/业务数据、浏览器资料和聊天记录进入 Git；禁止 git add -f 绕过保护。
+7. 回归：cmd /c run_tests.bat；测试版另运行 python -m unittest test_desktop_shortcut.py。Windows 跨盘 TEMP 的测试夹具问题按 HANDOFF 用同盘临时目录处理。
+8. 完成后用真实输出报告版本、源码提交、测试及未验证项；更新 README/HANDOFF 和核验记录，不把本地包、源码推送、GitHub Release、生产升级与真实业务成功混称。

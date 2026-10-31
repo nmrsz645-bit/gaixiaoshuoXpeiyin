@@ -17,7 +17,7 @@ from pathlib import Path
 import runtime
 import aliyun_tts
 from novel_monitor.logging_setup import retained_file_handler
-from novel_monitor.file_utils import move_to_directory
+from novel_monitor.file_utils import internal_queue_original_name, move_to_directory, same_title
 from novel_monitor.banned_rules_guard import banned_rules_guard
 from novel_monitor.deepseek_client import BannedRuleConfigError, find_banned_terms, load_banned_rules
 
@@ -37,6 +37,10 @@ class VoiceBannedTermError(ValueError):
     """A queued TXT cannot be voiced under the current banned-term rules."""
 
 
+class VoiceNameOccupiedError(RuntimeError):
+    """The original TXT title is still present in the completed output."""
+
+
 def ensure_voice_text_allowed(text, config):
     rules_dir = Path(config.get("banned_rules_dir") or BASE_DIR / "改写")
     banned_terms, _replacements = load_banned_rules(rules_dir)
@@ -49,12 +53,16 @@ def voice_rules_dir(config):
     return Path(config.get("banned_rules_dir") or BASE_DIR / "改写")
 
 
-def audio_sha256(path):
+def file_sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def audio_sha256(path):
+    return file_sha256(path)
 MIN_MP3_BYTES = 1024
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000 if os.name == "nt" else 0)
 MAX_COMPLETED_AUDIO_SECONDS = 59 * 60
@@ -117,6 +125,12 @@ def load_config(path=CONFIG_PATH):
         config.update(json.loads(path.read_text(encoding="utf-8-sig")))
     else:
         save_config(config, path)
+    # The rewrite monitor and the voice worker must inspect the same directory.
+    # Relative voice paths are anchored to the application config, not the process cwd.
+    for key in ("input_dir", "output_dir"):
+        configured = Path(config[key])
+        if not configured.is_absolute():
+            config[key] = str((Path(path).resolve().parent / configured).resolve())
     return config
 
 
@@ -205,7 +219,7 @@ def claim_text_file(path, config):
             task_dir.rmdir()
             raise
         claim_metadata = task_dir / "claim.json"
-        rewrite_id = rewrite_job_id(path)
+        rewrite_id = rewrite_job_id(path) if internal_queue_original_name(path, Path(config["input_dir"])) else None
         handoff_path = voice_handoff_dir(config) / f"{rewrite_id}.json" if rewrite_id else None
         try:
             _atomic_write_json(
@@ -248,21 +262,15 @@ def claim_text_file(path, config):
 def release_claim(path, config):
     path = Path(path)
     input_dir = Path(config["input_dir"])
-    job_id = rewrite_job_id(path)
     target = input_dir / path.name
-    if job_id and target.exists():
-        public = Path(public_queue_name(path))
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        counter = 1
-        while True:
-            target = input_dir / f"{public.stem}_{stamp}_{counter}.__rw_{job_id}{public.suffix}"
-            if not target.exists():
-                break
-            counter += 1
-        shutil.move(str(path), str(target))
-        released = target
-    else:
-        released = move_to_directory(path, input_dir)
+    if target.exists():
+        logging.info("同名配音队列文件仍在，保留已领取任务等待：%s", target)
+        return path
+    try:
+        released = path.rename(target)
+    except FileExistsError:
+        logging.info("同名配音队列文件刚被占用，保留已领取任务等待：%s", target)
+        return path
     _cleanup_claim(path, config)
     return released
 
@@ -455,26 +463,45 @@ def rewrite_job_id(text_path):
     return match.group(1).lower() if match else None
 
 
-def public_queue_name(text_path):
+def public_queue_name(text_path, config=None):
     path = Path(text_path)
-    stem = re.sub(r"\.__rw_[0-9a-fA-F]{32}$", "", path.stem)
-    return stem + path.suffix
+    if config:
+        original = internal_queue_original_name(path, Path(config["input_dir"]))
+        if original:
+            return original
+    return path.name
 
 
 def completion_paths_for(text_path, config):
-    text_path = Path(public_queue_name(text_path))
+    text_path = Path(public_queue_name(text_path, config))
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = text_path.stem
-    counter = 0
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    while True:
-        suffix = "" if counter == 0 else f"-{stamp}-{counter}"
-        audio = output_dir / f"{stem}{suffix}.mp3"
-        completed_text = output_dir / f"{stem}{suffix}{text_path.suffix}"
-        if not audio.exists() and not completed_text.exists():
-            return audio, completed_text
-        counter += 1
+    return output_dir / f"{text_path.stem}.mp3", output_dir / text_path.name
+
+
+def existing_output_for(text_path, config):
+    text_path = Path(text_path)
+    stem = Path(public_queue_name(text_path, config)).stem
+    output_dir = Path(config["output_dir"])
+    if not output_dir.exists():
+        return None
+    candidates = [
+        path for path in output_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in {".mp3", ".txt"} and same_title(stem, path)
+    ]
+    if not candidates:
+        return None
+    receipt = _load_receipt(_receipt_path(text_path, read_text(text_path), config))
+    owned_audio = Path(receipt["output_path"]) if receipt else None
+    expected_audio = output_dir / f"{stem}.mp3"
+    expected_text = output_dir / f"{stem}{text_path.suffix}"
+    for path in candidates:
+        if (path == expected_audio or (owned_audio and _same_path(path, owned_audio))) and receipt_owns_audio(path, receipt):
+            continue
+        if path == expected_text and receipt_owns_completed_text(path, receipt):
+            continue
+        return path
+    return None
 
 
 def _receipt_path(text_path, text, config):
@@ -581,6 +608,54 @@ def mp3_duration_seconds(path, runner=subprocess.run, ffmpeg_exe=None):
     return duration
 
 
+def receipt_owns_audio(path, receipt):
+    if not receipt or not _valid_mp3(path):
+        return False
+    expected_hashes = {receipt.get("audio_sha256"), receipt.get("publish_audio_sha256")}
+    expected_hashes.discard(None)
+    return bool(expected_hashes and audio_sha256(path) in expected_hashes)
+
+
+def _same_path(left, right):
+    return Path(left).resolve() == Path(right).resolve()
+
+
+def _file_identity(path):
+    try:
+        info = Path(path).stat()
+        return [info.st_dev, info.st_ino] if info.st_ino else None
+    except OSError:
+        return None
+
+
+def _publish_audio_without_overwrite(staged, output):
+    try:
+        os.link(staged, output)
+        return
+    except FileExistsError as exc:
+        raise VoiceNameOccupiedError(f"同名 MP3 仍在，等待文件移走：{output}") from exc
+    except OSError:
+        if os.name != "nt":
+            raise
+    # Windows rename is atomic and fails if the target already exists. It also
+    # works on file systems that do not support hard links.
+    try:
+        os.rename(staged, output)
+    except FileExistsError as exc:
+        raise VoiceNameOccupiedError(f"同名 MP3 仍在，等待文件移走：{output}") from exc
+
+
+def receipt_owns_completed_text(path, receipt):
+    staged = Path(receipt.get("staged_text_path") or "")
+    expected_hash = receipt.get("staged_text_sha256")
+    if not expected_hash or staged.parent != path.parent / ".voice-staging" or not path.is_file():
+        return False
+    if staged.is_file() and os.path.samefile(staged, path):
+        return file_sha256(path) == expected_hash
+    identity = receipt.get("staged_text_file_id")
+    return bool(identity and identity == _file_identity(path) and file_sha256(path) == expected_hash)
+
+
 def limit_completed_mp3_duration(path, runner=subprocess.run, ffmpeg_exe=None):
     path = Path(path)
     executable = ffmpeg_exe or _ffmpeg_executable()
@@ -613,24 +688,59 @@ def _receipt_for_current_output(receipt_path, receipt, text_path, config):
     current_output = Path(config["output_dir"]).resolve()
     old_audio = Path(receipt["output_path"])
     old_text = Path(receipt["completed_text_path"])
+    new_audio, new_text = completion_paths_for(text_path, config)
     try:
-        current_paths = old_audio.parent.resolve() == current_output and old_text.parent.resolve() == current_output
+        current_paths = (
+            old_audio.parent.resolve() == current_output
+            and old_text.parent.resolve() == current_output
+            and _same_path(old_audio, new_audio)
+            and _same_path(old_text, new_text)
+        )
     except OSError:
         current_paths = False
     if current_paths:
-        return receipt, old_audio, old_text
+        if old_audio != new_audio or old_text != new_text:
+            receipt = dict(receipt)
+            receipt.update({"output_path": str(new_audio), "completed_text_path": str(new_text)})
+            _save_receipt(receipt_path, receipt)
+        return receipt, new_audio, new_text
 
-    new_audio, new_text = completion_paths_for(text_path, config)
-    audio_ready = bool(receipt.get("audio_ready") and _valid_mp3(old_audio))
-    if audio_ready:
+    if new_text.exists() and not _same_path(old_text, new_text):
+        raise VoiceNameOccupiedError(f"同名 TXT 仍在，等待文件移走：{new_text}")
+    if receipt.get("audio_ready") and old_audio.exists() and not receipt_owns_audio(old_audio, receipt):
+        raise VoiceNameOccupiedError(f"旧路径 MP3 已被其他文件占用，等待文件移走：{old_audio}")
+    audio_ready = bool(receipt.get("audio_ready") and receipt_owns_audio(old_audio, receipt))
+    if new_audio.exists() and not receipt_owns_audio(new_audio, receipt):
+        raise VoiceNameOccupiedError(f"同名 MP3 仍在，等待文件移走：{new_audio}")
+    if audio_ready and not _same_path(old_audio, new_audio) and not new_audio.exists():
+        temporary = new_audio.with_name(f".{new_audio.stem}.{uuid.uuid4().hex}.moving.mp3")
         try:
-            shutil.copyfile(old_audio, new_audio)
-            if not _valid_mp3(new_audio):
+            shutil.copyfile(old_audio, temporary)
+            if not receipt_owns_audio(temporary, receipt):
                 raise RuntimeError("迁移后的 MP3 校验失败。")
-        except Exception:
-            new_audio.unlink(missing_ok=True)
-            raise
+            _publish_audio_without_overwrite(temporary, new_audio)
+        finally:
+            temporary.unlink(missing_ok=True)
     updated = dict(receipt)
+    migrated_stages = []
+    new_stage_dir = new_audio.parent / ".voice-staging"
+    for path_key, hash_key in (("staged_audio_path", "staged_audio_sha256"), ("publish_audio_path", "publish_audio_sha256")):
+        original = Path(receipt.get(path_key) or "")
+        expected = receipt.get(hash_key)
+        if not expected or original.parent != old_audio.parent / ".voice-staging" or not original.is_file():
+            continue
+        if not _valid_mp3(original) or audio_sha256(original) != expected:
+            continue
+        if original.parent == new_stage_dir:
+            continue
+        new_stage_dir.mkdir(parents=True, exist_ok=True)
+        moved_stage = new_stage_dir / f"{uuid.uuid4().hex}.mp3"
+        shutil.copyfile(original, moved_stage)
+        if audio_sha256(moved_stage) != expected:
+            moved_stage.unlink(missing_ok=True)
+            raise RuntimeError("迁移后的配音暂存校验失败。")
+        updated[path_key] = str(moved_stage)
+        migrated_stages.append((original, moved_stage, expected))
     updated.update(
         {
             "output_path": str(new_audio),
@@ -641,10 +751,13 @@ def _receipt_for_current_output(receipt_path, receipt, text_path, config):
     try:
         _save_receipt(receipt_path, updated)
     except Exception:
-        if audio_ready:
-            new_audio.unlink(missing_ok=True)
+        for _original, moved_stage, _expected in migrated_stages:
+            moved_stage.unlink(missing_ok=True)
         raise
-    if audio_ready:
+    for original, _moved_stage, expected in migrated_stages:
+        if original.is_file() and audio_sha256(original) == expected:
+            original.unlink(missing_ok=True)
+    if audio_ready and not _same_path(old_audio, new_audio) and receipt_owns_audio(old_audio, receipt):
         try:
             old_audio.unlink(missing_ok=True)
         except OSError:
@@ -800,8 +913,66 @@ def is_file_stable(path, stable_seconds, sleeper=time.sleep):
     return first.st_size == second.st_size and first.st_mtime_ns == second.st_mtime_ns
 
 
+def publish_completed_text(text_path, completed_text_path, receipt_path, receipt, config, text):
+    source_hash = file_sha256(text_path)
+    stage_dir = completed_text_path.parent / ".voice-staging"
+    staged = Path(receipt.get("staged_text_path") or "")
+    if (
+        staged.parent != stage_dir or not staged.is_file()
+        or receipt.get("staged_text_sha256") != source_hash
+        or file_sha256(staged) != source_hash
+    ):
+        if completed_text_path.exists():
+            raise VoiceNameOccupiedError(f"同名 TXT 仍在，等待文件移走：{completed_text_path}")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        staged = stage_dir / f"{uuid.uuid4().hex}.txt"
+        shutil.copyfile(text_path, staged)
+        if file_sha256(staged) != source_hash:
+            raise RuntimeError("配音 TXT 暂存校验失败，已保留源文本")
+        receipt.update({
+            "staged_text_path": str(staged), "staged_text_sha256": source_hash,
+            "staged_text_file_id": _file_identity(staged),
+        })
+        _save_receipt(receipt_path, receipt)
+    owned_text = receipt_owns_completed_text(completed_text_path, receipt)
+    if completed_text_path.exists() and not owned_text:
+        raise VoiceNameOccupiedError(f"同名 TXT 仍在，等待文件移走：{completed_text_path}")
+    if not owned_text:
+        try:
+            os.link(staged, completed_text_path)
+        except FileExistsError as exc:
+            raise VoiceNameOccupiedError(f"同名 TXT 仍在，等待文件移走：{completed_text_path}") from exc
+        except OSError:
+            if os.name != "nt":
+                raise
+            try:
+                os.rename(staged, completed_text_path)
+            except FileExistsError as exc:
+                raise VoiceNameOccupiedError(f"同名 TXT 仍在，等待文件移走：{completed_text_path}") from exc
+    try:
+        ensure_voice_text_allowed(text, config)
+    except (VoiceBannedTermError, BannedRuleConfigError):
+        if receipt_owns_completed_text(completed_text_path, receipt):
+            completed_text_path.unlink()
+        staged.unlink(missing_ok=True)
+        try:
+            stage_dir.rmdir()
+        except OSError:
+            pass
+        raise
+    text_path.unlink()
+    staged.unlink(missing_ok=True)
+    try:
+        stage_dir.rmdir()
+    except OSError:
+        pass
+
+
 def process_file(text_path, config, synthesize=synthesize, on_success=None):
     text_path = Path(text_path)
+    conflict = existing_output_for(text_path, config)
+    if conflict:
+        raise VoiceNameOccupiedError(f"同名配音成品仍在，等待文件移走：{conflict}")
     text = read_text(text_path)
     if not text:
         raise ValueError(f"待配音文本为空：{text_path.name}")
@@ -822,39 +993,89 @@ def process_file(text_path, config, synthesize=synthesize, on_success=None):
         }
         _save_receipt(receipt_path, receipt)
 
-    write_current_task(f"正在配音：{public_queue_name(text_path)}")
+    write_current_task(f"正在配音：{public_queue_name(text_path, config)}")
     try:
-        if receipt.get("audio_ready") and _valid_mp3(output_path):
+        if output_path.exists():
+            if not receipt_owns_audio(output_path, receipt):
+                raise VoiceNameOccupiedError(f"同名 MP3 仍在，等待文件移走：{output_path}")
             actual_engine = receipt.get("engine", "edge")
         else:
-            output_path.unlink(missing_ok=True)
-            actual_engine = asyncio.run(synthesize(text, output_path, config))
-            if not _valid_mp3(output_path):
-                output_path.unlink(missing_ok=True)
-                raise RuntimeError("配音接口未生成有效 MP3，已保留源 TXT。")
-            receipt.update({"audio_ready": True, "engine": actual_engine, "audio_sha256": audio_sha256(output_path)})
+            stage_dir = output_path.parent / ".voice-staging"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            staged = Path(receipt.get("staged_audio_path") or "")
+            stage_hash = receipt.get("staged_audio_sha256")
+            staged_valid = bool(
+                stage_hash and staged.parent == stage_dir and _valid_mp3(staged)
+                and audio_sha256(staged) == stage_hash
+            )
+            if not staged_valid:
+                if staged.parent == stage_dir:
+                    staged.unlink(missing_ok=True)
+                staged = stage_dir / f"{uuid.uuid4().hex}.mp3"
+                receipt.update({
+                    "staged_audio_path": str(staged), "staged_audio_sha256": None,
+                    "publish_audio_path": None, "publish_audio_sha256": None,
+                })
+                _save_receipt(receipt_path, receipt)
+                actual_engine = asyncio.run(synthesize(text, staged, config))
+                if not _valid_mp3(staged):
+                    staged.unlink(missing_ok=True)
+                    try:
+                        stage_dir.rmdir()
+                    except OSError:
+                        pass
+                    raise RuntimeError("配音接口未生成有效 MP3，已保留源 TXT。")
+                stage_hash = audio_sha256(staged)
+                receipt.update({"staged_audio_sha256": stage_hash, "engine": actual_engine})
+                _save_receipt(receipt_path, receipt)
+            else:
+                actual_engine = receipt.get("engine", "edge")
+            publish_stage = Path(receipt.get("publish_audio_path") or "")
+            publish_hash = receipt.get("publish_audio_sha256")
+            publish_valid = bool(
+                publish_hash and publish_stage.parent == stage_dir and _valid_mp3(publish_stage)
+                and audio_sha256(publish_stage) == publish_hash
+            )
+            if not publish_valid:
+                if publish_stage.parent == stage_dir:
+                    publish_stage.unlink(missing_ok=True)
+                publish_stage = stage_dir / f"{uuid.uuid4().hex}.mp3"
+                receipt.update({"publish_audio_path": str(publish_stage), "publish_audio_sha256": None})
+                _save_receipt(receipt_path, receipt)
+                shutil.copyfile(staged, publish_stage)
+                final_duration, was_trimmed = limit_completed_mp3_duration(publish_stage)
+                if not _valid_mp3(publish_stage):
+                    raise RuntimeError("配音裁剪暂存无效，已保留合成音频和 TXT。")
+                publish_hash = audio_sha256(publish_stage)
+                receipt.update({
+                    "publish_audio_sha256": publish_hash,
+                    "duration_seconds": round(final_duration, 3),
+                    "trimmed_to_seconds": TRIMMED_AUDIO_SECONDS if was_trimmed else None,
+                })
+                _save_receipt(receipt_path, receipt)
+            if not output_path.exists():
+                try:
+                    _publish_audio_without_overwrite(publish_stage, output_path)
+                except VoiceNameOccupiedError:
+                    if not receipt_owns_audio(output_path, receipt):
+                        raise
+            if not receipt_owns_audio(output_path, receipt):
+                raise VoiceNameOccupiedError(f"同名 MP3 仍在，等待文件移走：{output_path}")
+            receipt.update({"audio_ready": True, "engine": actual_engine, "audio_sha256": publish_hash})
             _save_receipt(receipt_path, receipt)
-        final_duration, was_trimmed = limit_completed_mp3_duration(output_path)
-        receipt.update({
-            "audio_ready": True,
-            "engine": actual_engine,
-            "duration_seconds": round(final_duration, 3),
-            "trimmed_to_seconds": TRIMMED_AUDIO_SECONDS if was_trimmed else None,
-            "audio_sha256": audio_sha256(output_path),
-        })
-        _save_receipt(receipt_path, receipt)
+            staged.unlink(missing_ok=True)
+            publish_stage.unlink(missing_ok=True)
+            try:
+                stage_dir.rmdir()
+            except OSError:
+                pass
     finally:
         clear_current_task()
 
     with banned_rules_guard(voice_rules_dir(config)):
         ensure_voice_text_allowed(text, config)
         if config.get("keep_text_after_voice", True) and config.get("source_after_success", "move_to_output") == "move_to_output":
-            shutil.move(str(text_path), str(completed_text_path))
-            try:
-                ensure_voice_text_allowed(text, config)
-            except (VoiceBannedTermError, BannedRuleConfigError):
-                shutil.move(str(completed_text_path), str(text_path))
-                raise
+            publish_completed_text(text_path, completed_text_path, receipt_path, receipt, config, text)
         elif not config.get("keep_text_after_voice", True) or config.get("delete_source", True):
             text_path.unlink()
     receipt_path.unlink(missing_ok=True)
@@ -948,6 +1169,10 @@ def process_once(
             if not stable_checker(text_path, stable_seconds):
                 logging.info("File is still changing, skip this round: %s", text_path)
                 continue
+            conflict = existing_output_for(text_path, config)
+            if conflict:
+                logging.info("同名配音成品仍在，等待文件移走：%s", conflict)
+                continue
             if stop_checker():
                 break
             with banned_rules_guard(voice_rules_dir(config)):
@@ -963,6 +1188,11 @@ def process_once(
         except Exception as exc:
             if claimed is None:
                 logging.exception("配音文件领取失败，将在下一轮重试: %s", text_path)
+                continue
+            if isinstance(exc, VoiceNameOccupiedError):
+                if Path(claimed).exists():
+                    release_claim(claimed, config)
+                logging.info("同名配音成品仍在，等待文件移走：%s", exc)
                 continue
             if isinstance(exc, BannedRuleConfigError):
                 if Path(claimed).exists():

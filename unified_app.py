@@ -549,7 +549,10 @@ class UnifiedService:
             raise RuntimeError(f"改小说输出目录与配音输入目录不一致：{config.output_dir} / {voice_config['input_dir']}")
         ensure_directories(config)
         logger = setup_logging(config.log_dir)
-        self.rewrite_service = MonitorService(config, logger, lambda _stats: None, self.on_log, self._on_rewrite_result)
+        self.rewrite_service = MonitorService(
+            config, logger, lambda _stats: None, self.on_log, self._on_rewrite_result,
+            voice_output_dir=lambda: Path(voice_monitor.load_config()["output_dir"]),
+        )
         self.rewrite_service.start()
         self.on_log(f"流程目录已统一：改写输出和配音输入均为 {config.output_dir}")
 
@@ -657,6 +660,7 @@ class App(tk.Tk):
         page = ttk.Frame(tabs, padding=16)
         tabs.add(page, text="自动流程")
         ttk.Label(page, text="待改小说 TXT  →  AI 改写  →  已改完成 TXT  →  自动配音  →  完成（TXT + MP3）", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(page, text="同题文件仍在时，该书等待文件移走后自动继续；最终 MP3 沿用原始 TXT 名称。", wraplength=780).pack(anchor="w", pady=(8, 0))
         ttk.Label(page, text="配音失败时，TXT 会保留在“已改完成”，仅重试配音，不会重新改写。", wraplength=780).pack(anchor="w", pady=(10, 4))
         ttk.Label(page, textvariable=self.counts).pack(anchor="w", pady=(8, 16))
         ttk.Label(page, textvariable=self.today_stats, justify="left", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 12))
@@ -688,6 +692,7 @@ class App(tk.Tk):
         self.ai_service = tk.StringVar(value=ai_service_for_url(self.rewrite_url.get()))
         self.max_request_chars = tk.StringVar(value=str(data.get("maxRequestChars", 8000)))
         self.request_timeout_seconds = tk.StringVar(value=str(data.get("requestTimeoutSeconds", 300)))
+        self.semantic_compliance_enabled = tk.BooleanVar(value=data.get("semanticComplianceEnabled") is True)
         ttk.Label(page, text="待改小说 TXT 文件夹").grid(row=0, column=0, sticky="w", pady=5)
         ttk.Entry(page, textvariable=self.source_dir, width=64).grid(row=0, column=1, sticky="ew", pady=5)
         ttk.Button(page, text="选择文件夹", command=self.choose_source_dir).grid(row=0, column=2, padx=(6, 0), pady=5)
@@ -709,11 +714,14 @@ class App(tk.Tk):
             else:
                 ttk.Entry(page, textvariable=variable, width=76, show="*" if secret else "").grid(row=row, column=1, sticky="ew", pady=5)
         page.columnconfigure(1, weight=1)
+        ttk.Checkbutton(page, text="AI 场景审改（保留主要事件与结局，删细节并补衔接）", variable=self.semantic_compliance_enabled).grid(row=8, column=1, sticky="w", pady=5)
         buttons = ttk.Frame(page)
-        buttons.grid(row=8, column=1, sticky="w", pady=12)
+        buttons.grid(row=9, column=1, sticky="w", pady=12)
         ttk.Button(buttons, text="保存改小说设置", command=self.save_rewrite).pack(side="left")
         ttk.Button(buttons, text="编辑合规规则", command=lambda: self.edit_text_file(REWRITE_DIR / RULES_FILE_NAME, "合规规则")).pack(side="left", padx=6)
         ttk.Button(buttons, text="编辑指定违禁词", command=lambda: self.edit_text_file(REWRITE_DIR / BANNED_TERMS_FILE_NAME, "指定违禁词")).pack(side="left")
+        ttk.Label(page, text="正文自动清理：删除单个数字独行、章节标题及“1.正文”式编号整行；仅保留前7000字（不计空白）。原文自动备份。",
+                  wraplength=760, foreground="#52657a").grid(row=10,column=0,columnspan=3,sticky="w",pady=(0,8))
 
     def _build_voice_tab(self, tabs) -> None:
         page = ttk.Frame(tabs, padding=16)
@@ -803,6 +811,7 @@ class App(tk.Tk):
         data["deepseekModel"] = self.model.get().strip()
         data["maxRequestChars"] = max_request_chars
         data["requestTimeoutSeconds"] = request_timeout_seconds
+        data["semanticComplianceEnabled"] = bool(self.semantic_compliance_enabled.get())
         (REWRITE_DIR / "config.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         self.log("改小说设置已保存。")
         return True

@@ -1,0 +1,126 @@
+{
+  "schema": 1,
+  "version": "1.0.30",
+  "channel": "stable",
+  "original_build_source_commit": "ad6c3aa3f32139102c55630cb6017d2c45bb8018",
+  "source_version_marker": "1.0.26",
+  "application_source_hash_normalization": "CRLF converted to LF; other bytes unchanged",
+  "application_sources": [
+    {
+      "path": "aliyun_tts.py",
+      "sha256": "b6f22e4ef55dabf7482e8729ce6fa6c4d07fba72f8493254eee666c6df0d78f4"
+    },
+    {
+      "path": "credential_store.py",
+      "sha256": "492f62f0786d7bec21784edfde8a38d15a14e3e10739eeef633f9c0932c7b031"
+    },
+    {
+      "path": "novel_monitor/__init__.py",
+      "sha256": "5917d017276cc5b752120a8e1e0838214d77f3224d02381bfae16fb3ffac8fcd"
+    },
+    {
+      "path": "novel_monitor/banned_rules_guard.py",
+      "sha256": "64f1b679b4c577d059de70c8da3904ba0c3950e312b2fa08e90cde1f5799ca65"
+    },
+    {
+      "path": "novel_monitor/config.py",
+      "sha256": "1386b2fd4376030b75cbdcee35e7479ea7d7001f662c79f0e22f71f77310e81a"
+    },
+    {
+      "path": "novel_monitor/deepseek_client.py",
+      "sha256": "c84b244d8d645d31035b1151df095ce5a878954bab7f1c54eeae21f22d92695a"
+    },
+    {
+      "path": "novel_monitor/file_utils.py",
+      "sha256": "37d896f473b690447d1699fce321793db294c39d7741d27fd8521f6ea63a90b1"
+    },
+    {
+      "path": "novel_monitor/history.py",
+      "sha256": "c1d49a4a6301835504e7acb47c1f4b1563a54f3ec3ae7b3b94f98ac03009db23"
+    },
+    {
+      "path": "novel_monitor/logging_setup.py",
+      "sha256": "6a20e86bab07b71dd50fe7736d6c590bf772f411ef1bdfbf6f35b8089ceec90b"
+    },
+    {
+      "path": "novel_monitor/main.py",
+      "sha256": "8c3ae02f27cbc04e2854a46a62f026b1ea2232f6734326e3039f67d5c05c4b2b"
+    },
+    {
+      "path": "novel_monitor/manager_gui.py",
+      "sha256": "b28049624ea31b14a22616bb26c9c4e950f76c5f59216ee428bcb709685b847f"
+    },
+    {
+      "path": "novel_monitor/monitor_service.py",
+      "sha256": "dfed6830e627d9fdb973654519c7cf88d8dc7c330ec8abec4664a86e4187d711"
+    },
+    {
+      "path": "novel_monitor/processor.py",
+      "sha256": "0af90631cec497bfda362709b395c832b99c11cdc51c08cbac3d0cc1d737f8f7"
+    },
+    {
+      "path": "novel_monitor/runner.py",
+      "sha256": "f3768b17222482e81089bd932f9098168c07fc943ba230b22fd74f5680b4a43d"
+    },
+    {
+      "path": "novel_monitor/scene_document.py",
+      "sha256": "9e3c3dc2a3d49732cd5205a877b4aa5831876a7290f1377777a86d9735254e2b"
+    },
+    {
+      "path": "novel_monitor/scene_model.py",
+      "sha256": "bbeac32f57eaefcf464df7b4e269963af669537bf5b8adf8ac010a889c49dba4"
+    },
+    {
+      "path": "novel_monitor/scene_review.py",
+      "sha256": "8b054bfe01ca1169e2fbcc8c737e146d12800375a3c0a15cccee88a05824a612"
+    },
+    {
+      "path": "novel_monitor/self_check.py",
+      "sha256": "1e75749d5d9ad68a3d094507f4c319ae7703d741654373610dd02006d5ebeac8"
+    },
+    {
+      "path": "novel_monitor/semantic_compliance.py",
+      "sha256": "20e4104f80b8cf5547f8c2ffc59fefafca25968e3d1ac91a44453d52415e13f8"
+    },
+    {
+      "path": "novel_monitor/startup.py",
+      "sha256": "4edd599557f2ad09c877a8800966e95d888789c154778d72cb5523ea749a8566"
+    },
+    {
+      "path": "novel_monitor/status.py",
+      "sha256": "de9a813d3526d5946c04fbed7c483553b32af76edc0428afa6d27f0d473b0602"
+    },
+    {
+      "path": "novel_monitor/text_preparation.py",
+      "sha256": "7120558af5db3633327a6f984b59448df9d99136c5b9c0cb38d8e63aa0809582"
+    },
+    {
+      "path": "novel_monitor/wecom_client.py",
+      "sha256": "3e067be152f77a051d3008cc8dcf39e6b85591e32f4bb3fd44660cbd6b8292bb"
+    },
+    {
+      "path": "runtime.py",
+      "sha256": "3161bf56423ae243d23109eeefc8c60ddcedee89354f0868aad897cb89a06023"
+    },
+    {
+      "path": "unified_app.py",
+      "sha256": "5732145e06a15d4f7a4e3ab4354611701c1a0143e3356584702a1ca399026912"
+    },
+    {
+      "path": "voice_monitor.py",
+      "sha256": "ceb460630bbfdd4e0a6dde5ef26c28438bf4fbcf58aedaf9c7f6f7d7ad5c1d67"
+    }
+  ],
+  "windows_artifacts": [
+    {
+      "path": "novel-processing-center-1.0.30-windows-x64.zip",
+      "sha256": "99b205a1184a7e4898448bd91d1a8160c8edd62822244646baea87d2c00dfc6d"
+    },
+    {
+      "path": "novel-processing-center-1.0.30-update.zip",
+      "sha256": "757eea0f5e93fffe0127486837bab09d251d30271576264bbc310e0ba87f0a46"
+    }
+  ],
+  "runtime_code_modified_for_github_completion": false,
+  "updater_original_source_status": "not_confirmed; fixed binary dependency documented in docs/updater-dependency.md"
+}

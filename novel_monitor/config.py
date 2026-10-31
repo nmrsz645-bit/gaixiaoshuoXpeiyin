@@ -25,6 +25,7 @@ class AppConfig:
     deepseek_url: str = DEFAULT_AI_URL
     max_request_chars: int = 8000
     request_timeout_seconds: int = 300
+    semantic_compliance_enabled: bool = False
 
 
 def _read_required_text(path: Path, label: str, allow_blank: bool = False, default: str = "") -> str:
@@ -104,6 +105,7 @@ def load_config(root: Path, allow_blank_secrets: bool = False, portable_defaults
         ),
         max_request_chars=int(data.get("maxRequestChars", 8000)),
         request_timeout_seconds=int(data.get("requestTimeoutSeconds", 300)),
+        semantic_compliance_enabled=data.get("semanticComplianceEnabled") is True,
     )
 
 
