@@ -17,7 +17,7 @@ from pathlib import Path
 import runtime
 import aliyun_tts
 from novel_monitor.logging_setup import retained_file_handler
-from novel_monitor.file_utils import internal_queue_original_name, move_to_directory, same_title
+from novel_monitor.file_utils import internal_queue_original_name, move_to_directory, recycle_expired_completed_file, same_title
 from novel_monitor.banned_rules_guard import banned_rules_guard
 from novel_monitor.deepseek_client import BannedRuleConfigError, find_banned_terms, load_banned_rules
 
@@ -479,7 +479,7 @@ def completion_paths_for(text_path, config):
     return output_dir / f"{text_path.stem}.mp3", output_dir / text_path.name
 
 
-def existing_output_for(text_path, config):
+def existing_output_for(text_path, config, *, recycle_expired=False):
     text_path = Path(text_path)
     stem = Path(public_queue_name(text_path, config)).stem
     output_dir = Path(config["output_dir"])
@@ -495,11 +495,26 @@ def existing_output_for(text_path, config):
     owned_audio = Path(receipt["output_path"]) if receipt else None
     expected_audio = output_dir / f"{stem}.mp3"
     expected_text = output_dir / f"{stem}{text_path.suffix}"
+    protected_dirs = None
     for path in candidates:
         if (path == expected_audio or (owned_audio and _same_path(path, owned_audio))) and receipt_owns_audio(path, receipt):
             continue
         if path == expected_text and receipt_owns_completed_text(path, receipt):
             continue
+        if recycle_expired:
+            if protected_dirs is None:
+                rewrite_dir = voice_rules_dir(config)
+                protected_dirs = (Path(config["input_dir"]), rewrite_dir, voice_failed_dir(config))
+                try:
+                    rewrite_input = (rewrite_dir / "检测.txt").read_text(encoding="utf-8-sig").strip()
+                except FileNotFoundError:
+                    rewrite_input = ""
+                except (OSError, ValueError):
+                    return path
+                if rewrite_input:
+                    protected_dirs += (Path(rewrite_input),)
+            if recycle_expired_completed_file(path, protected_dirs, logging.getLogger(__name__)):
+                continue
         return path
     return None
 
@@ -1166,12 +1181,14 @@ def process_once(
             logging.info("Failed file is waiting to retry: %s", text_path)
             continue
         try:
-            if not stable_checker(text_path, stable_seconds):
-                logging.info("File is still changing, skip this round: %s", text_path)
-                continue
-            conflict = existing_output_for(text_path, config)
+            conflict = existing_output_for(text_path, config, recycle_expired=True)
+            if not conflict:
+                if not stable_checker(text_path, stable_seconds):
+                    logging.info("File is still changing, skip this round: %s", text_path)
+                    continue
+                conflict = existing_output_for(text_path, config, recycle_expired=True)
             if conflict:
-                logging.info("同名配音成品仍在，等待文件移走：%s", conflict)
+                logging.info("同名配音成品仍在，跳过本书并继续处理其他书籍：%s（占用：%s）", text_path.name, conflict)
                 continue
             if stop_checker():
                 break
@@ -1192,7 +1209,7 @@ def process_once(
             if isinstance(exc, VoiceNameOccupiedError):
                 if Path(claimed).exists():
                     release_claim(claimed, config)
-                logging.info("同名配音成品仍在，等待文件移走：%s", exc)
+                logging.info("同名配音成品仍在，跳过本书并继续处理其他书籍：%s（%s）", text_path.name, exc)
                 continue
             if isinstance(exc, BannedRuleConfigError):
                 if Path(claimed).exists():

@@ -5,10 +5,17 @@ import json
 import shutil
 import time
 import hashlib
+import logging
 import os
+import stat
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from tempfile import mkdtemp
+
+
+EXPIRED_OUTPUT_DIR = ".expired-name-conflicts"
+OUTPUT_EXPIRY_SECONDS = 24 * 60 * 60
 
 
 def public_stem(name: str) -> str:
@@ -56,6 +63,57 @@ def matching_title_file(directory: Path, stem: str, extensions: set[str], *, rec
     return None
 
 
+def recycle_expired_completed_file(path: Path, protected_dirs: tuple[Path, ...], logger: logging.Logger) -> bool:
+    """Remove an expired completion from its public path with a recoverable rename."""
+    try:
+        original = path.lstat()
+        if (
+            not stat.S_ISREG(original.st_mode)
+            or getattr(original, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            return False
+        newest_time = max(original.st_mtime, getattr(original, "st_birthtime", original.st_mtime))
+        if time.time() - newest_time <= OUTPUT_EXPIRY_SECONDS:
+            return False
+        completed_dir = path.parent.resolve()
+        for protected in protected_dirs:
+            protected = protected.resolve()
+            if completed_dir.is_relative_to(protected) or protected.is_relative_to(completed_dir):
+                return False
+
+        recycle_dir = completed_dir / EXPIRED_OUTPUT_DIR
+        recycle_dir.mkdir(exist_ok=True)
+        directory_stat = recycle_dir.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or getattr(directory_stat, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            return False
+        target = Path(mkdtemp(dir=recycle_dir)) / path.name
+        moved = False
+        try:
+            current = path.lstat()
+            if (
+                not os.path.samestat(original, current)
+                or current.st_mtime_ns != original.st_mtime_ns
+                or current.st_ctime_ns != original.st_ctime_ns
+                or current.st_size != original.st_size
+            ):
+                return False
+            path.rename(target)
+            moved = True
+        finally:
+            if not moved:
+                target.parent.rmdir()
+    except FileNotFoundError:
+        return not path.exists()
+    except OSError:
+        logger.debug("同名旧成品暂时无法回收：%s", path, exc_info=True)
+        return False
+    logger.info("同名成品超过24小时，已回收：%s → %s", path, target)
+    return True
+
+
 def _own_voice_handoff(source: Path, voice_queue_dir: Path) -> bool:
     """A publish marker alone does not mean voice accepted this job."""
     job_id = source.parent.name
@@ -80,7 +138,10 @@ def _own_voice_handoff(source: Path, voice_queue_dir: Path) -> bool:
         return False
 
 
-def rewrite_name_conflict(source: Path, input_dir: Path, voice_queue_dir: Path, voice_output_dir: Path | None) -> Path | None:
+def rewrite_name_conflict(
+    source: Path, input_dir: Path, voice_queue_dir: Path, voice_output_dir: Path | None,
+    *, recycle_logger: logging.Logger | None = None,
+) -> Path | None:
     stem = public_stem(source.name)
     processing_dir = input_dir / ".rewrite-processing"
     claimed = source.parent.parent.resolve() == processing_dir.resolve()
@@ -111,7 +172,11 @@ def rewrite_name_conflict(source: Path, input_dir: Path, voice_queue_dir: Path, 
     # A published claim may be recovering after the voice worker already took
     # its own queue file. Let its idempotent publish state finish cleanup.
     if voice_output_dir and not own_voice_handoff:
-        return matching_title_file(voice_output_dir, stem, {".txt", ".mp3"})
+        while conflict := matching_title_file(voice_output_dir, stem, {".txt", ".mp3"}):
+            if recycle_logger is None or not recycle_expired_completed_file(
+                conflict, (input_dir, voice_queue_dir), recycle_logger
+            ):
+                return conflict
     return None
 
 

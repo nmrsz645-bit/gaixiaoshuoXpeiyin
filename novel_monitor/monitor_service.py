@@ -52,7 +52,24 @@ class MonitorService:
         return rewrite_name_conflict(
             source, self.config.input_dir, self.config.output_dir,
             Path(voice_output_dir) if voice_output_dir else None,
+            recycle_logger=self.logger,
         )
+
+    def _skip_name_conflict(self, path: Path) -> bool:
+        conflict = self._name_conflict(path)
+        with self._state_lock:
+            previous = self._waiting_names.get(path)
+            if conflict == previous:
+                return conflict is not None
+            if conflict:
+                self._waiting_names[path] = conflict
+            else:
+                self._waiting_names.pop(path, None)
+        if conflict:
+            self._emit_log(f"同名文件仍在，跳过本书并继续处理其他书籍：{path.name}（占用：{conflict}）")
+        else:
+            self._emit_log(f"同名占用已解除，恢复排队：{path.name}")
+        return conflict is not None
 
     def is_running(self) -> bool:
         with self._state_lock:
@@ -102,6 +119,13 @@ class MonitorService:
                 return False
             if sum(not future.done() for future in self._futures) >= self.WORKER_COUNT:
                 return False
+        try:
+            if path.exists() and self._skip_name_conflict(path):
+                return False
+        except OSError:
+            # Let the worker handle filesystem errors for this book as before.
+            pass
+        with self._state_lock:
             self._in_flight.add(path)
             try:
                 future = self._executor.submit(self._attempt, path)
@@ -168,6 +192,7 @@ class MonitorService:
         if not path.exists():
             with self._state_lock:
                 self.retry_queue.pop(path, None)
+                self._waiting_names.pop(path, None)
             return
         active_path: Path | None = None
         try:
@@ -180,31 +205,16 @@ class MonitorService:
                 if self._stop.is_set():
                     return
                 with self._name_lock, title_claim_guard(self.config.input_dir, path.name) as acquired:
-                    if not acquired:
+                    if not acquired or self._skip_name_conflict(path):
                         return
-                    conflict = self._name_conflict(path)
-                    if conflict:
-                        if self._waiting_names.get(path) != conflict:
-                            self._waiting_names[path] = conflict
-                            self._emit_log(f"同名文件仍在，改写等待：{path.name}（占用：{conflict}）")
-                        return
-                    if self._waiting_names.pop(path, None):
-                        self._emit_log(f"同名文件已移走，恢复改写：{path.name}")
                     try:
                         path = claim_source(path, self.config)
                     except FileNotFoundError:
                         return
                 if self._stop.is_set():
                     return
-            else:
-                conflict = self._name_conflict(path)
-                if conflict:
-                    if self._waiting_names.get(path) != conflict:
-                        self._waiting_names[path] = conflict
-                        self._emit_log(f"同名文件仍在，改写等待：{path.name}（占用：{conflict}）")
-                    return
-                if self._waiting_names.pop(path, None):
-                    self._emit_log(f"同名文件已移走，恢复改写：{path.name}")
+            elif self._skip_name_conflict(path):
+                return
             active_path = path
             with self._state_lock:
                 self._active[active_path] = {

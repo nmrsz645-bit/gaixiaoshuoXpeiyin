@@ -1,4 +1,4 @@
-# 小说处理中心 1.0.30
+# 小说处理中心 1.0.31
 
 > 新 Windows 接手、环境、构建、版本、OSS/网站、验收回滚和凭据：**[完整发布指南](docs/RELEASE-GUIDE.md)**。
 
@@ -8,15 +8,15 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 
 ## 版本、源码和下载
 
-- 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.30) 含可运行 Windows 包、校验文件及说明文档。
+- 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.31) 含可运行 Windows 包、校验文件及说明文档。
 - 本公开仓库维护正式版源码；测试版单独维护，不能误标为稳定版或擅自公开测试源码。
-- 正式版仍为 **1.0.30**；**1.0.31-beta 是测试版**。版本数字较大不表示已通过正式发布验收。GitHub Release 与 OSS 客户端更新是两个独立渠道。
-- 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [本轮核验记录](docs/releases/2026-10-31-github-verification.md)。
-- 本分支根 `version.json` 和源码显示回退值均为 **1.0.30**。源码启动读取该文件，构建也必须显式传 `--version 1.0.30`；旧标签中的 1.0.26 开发元数据已在后续维护分支修正，原 Windows 包和标签保持不变。
+- 正式版为 **1.0.31**。本版包含同名跳过、超过 24 小时的同名成品回收和自动流程页提示。GitHub Release 与 OSS 客户端更新分别验证。
+- 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [1.0.31 变更说明](docs/releases/2026-11-10-v1.0.31.md)。
+- 本分支根 `version.json` 和源码显示回退值均为 **1.0.31**。源码启动读取该文件，构建也必须显式传 `--version 1.0.31`；旧标签中的 1.0.26 开发元数据已在后续维护分支修正，原 Windows 包和标签保持不变。
 
 ## GitHub Latest 兼容约束
 
-最新正式程序为 1.0.30，使用上方版本专属 Release 链接下载。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
+最新正式程序为 1.0.31，使用上方版本专属 Release 链接下载。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
 
 ## Windows 安装与启动
 
@@ -48,7 +48,7 @@ AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_w
 4. 两条路径都先整行删除单个 0～9 数字行、以“第1章/第一章”开头的行及 `1.正文/12.正文` 式编号行；识别时允许行首连续 `#`。`###12`、普通 `###正文标题`、日期和小数保留。先删行，再只取前 **7000 个非空白字符**，标点计入，超出的结尾会被截掉。
 5. 有删行/截断时保存原始字节备份和映射；空送审正文保留原文并停止该篇。审改保护范围是清理后保留的正文。场景编辑保留关键事件性质、人物关系和结局；剩余内容风险会记录后继续，必需技术/协议/事实核对未完成则保留进度等待重试。
 6. AI 最后核对后执行指定词精确替换/遮盖，再执行固定清理；此后不再调用 AI。TXT 处理不保证广告标题、封面、字幕或视频审核通过。
-7. MP3 使用最初 TXT 的文件名主体。同名排队/处理中/完成 TXT 或 MP3 仍存在时等待，不覆盖、不自动改名。配音失败保留已改 TXT，仅按回执恢复配音。
+7. MP3 使用最初 TXT 的文件名主体。完成目录的同名 TXT 或 MP3 超过 24 小时后，程序将旧成品移入该目录下的 `.expired-name-conflicts`，再处理这本书。时长按创建时间和最后修改时间中的较晚者计算。队列和处理中任务保留原位。占用仍存在时跳过该书，其他书继续处理。配音失败保留已改 TXT，仅按回执恢复配音。
 8. 新生成 MP3 超过 59 分钟时保留前 35 分钟；59 分钟及以内不裁，历史成品不回头处理。裁剪失败保留原音频和回执。
 9. 停止任务用界面“停止”；退出前关闭无人值守。不要强制清空处理中目录来解除等待。
 
@@ -57,7 +57,7 @@ AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_w
 | 现象 | 核对方法 |
 | --- | --- |
 | 缺少 Key/Webhook，启动失败 | 在设置页补齐并保存。不要把真实配置上传到 GitHub 求助。 |
-| 同名文件仍在，改写等待 | 读取提示中的占用完整路径，检查 `.rewrite-processing`、配音输入、`.voice-processing` 和完成目录。界面 TXT 数为 0 不代表内部事务目录为空；保留任务 ID、时间和日志后分析，不删除锁/任务目录。 |
+| 同名文件仍在，跳过本书 | 本轮继续处理其他书。提示中的占用路径可定位 `.rewrite-processing`、配音输入、`.voice-processing` 或完成目录里的文件。旧成品回收日志记录原路径和回收位置。排查时保留任务 ID、时间、日志和事务文件。 |
 | 已改完成有 JSON，但等待配音为 0 | 默认配音只扫描 TXT；`.preparation.json` 是清理/备份/映射记录，`.semantic-review.json` 是审改/风险报告。`.rewrite-queue-names/*.json` 是任务原名关联，回执是防重/恢复依据；不能一概删除。 |
 | Edge 403、断网或阿里云失败 | 看 `app/voice_monitor.log` 和所选服务；`edge` 不会转阿里云，只有 `edge_then_aliyun` 会按配置回退。先保留 TXT/音频/回执，不对全部任务盲目重复合成。 |
 | 改写中断或发送结果不确定 | 保留 `.rewrite-processing`、重试/模式文件和发送凭据，先核实外部发送结果，再决定恢复，避免重复收费或重复发送。 |

@@ -88,7 +88,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.30"
+DEFAULT_APP_VERSION = "1.0.31"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -660,7 +660,7 @@ class App(tk.Tk):
         page = ttk.Frame(tabs, padding=16)
         tabs.add(page, text="自动流程")
         ttk.Label(page, text="待改小说 TXT  →  AI 改写  →  已改完成 TXT  →  自动配音  →  完成（TXT + MP3）", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(page, text="同题文件仍在时，该书等待文件移走后自动继续；最终 MP3 沿用原始 TXT 名称。", wraplength=780).pack(anchor="w", pady=(8, 0))
+        ttk.Label(page, text="遇到同名占用时，只跳过这本书，其他书继续处理。完成目录中的同名成品超过 24 小时后会自动回收，腾出文件名后继续处理这本书。最终 MP3 沿用原始 TXT 名称。", wraplength=780).pack(anchor="w", pady=(8, 0))
         ttk.Label(page, text="配音失败时，TXT 会保留在“已改完成”，仅重试配音，不会重新改写。", wraplength=780).pack(anchor="w", pady=(10, 4))
         ttk.Label(page, textvariable=self.counts).pack(anchor="w", pady=(8, 16))
         ttk.Label(page, textvariable=self.today_stats, justify="left", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 12))

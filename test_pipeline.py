@@ -21,6 +21,7 @@ import novel_monitor.monitor_service as rewrite_monitor
 import novel_monitor.runner as rewrite_runner
 from novel_monitor.config import AppConfig, load_config
 from novel_monitor import deepseek_client
+from novel_monitor import file_utils
 from novel_monitor import semantic_compliance
 from novel_monitor.deepseek_client import validate_optimized_text
 import novel_monitor.history as history_store
@@ -2880,12 +2881,12 @@ class PipelineTests(unittest.TestCase):
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
             version_file.write_text("not-json", encoding="utf-8")
-            self.assertEqual(read_app_version((version_file,)), "1.0.30")
+            self.assertEqual(read_app_version((version_file,)), "1.0.31")
             version_file.unlink()
-            self.assertEqual(read_app_version((version_file,)), "1.0.30")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.30")
-        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.30")
-        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.30")
+            self.assertEqual(read_app_version((version_file,)), "1.0.31")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.31")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.31")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.31")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
     def test_aliyun_random_voice_selection_uses_only_known_voices(self):
@@ -3945,11 +3946,14 @@ class PipelineTests(unittest.TestCase):
             service = rewrite_monitor.MonitorService(
                 config, logging.getLogger("test-name-wait"), lambda *_: None, lambda *_: None
             )
-            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
+            occupied_time = occupied.stat().st_mtime
+            with patch.object(file_utils.time, "time", return_value=occupied_time + 25 * 60 * 60), \
+                 patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
                  patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
                  patch.object(rewrite_processor, "send_file"):
                 service.process_once(source)
                 self.assertTrue(source.exists())
+                self.assertEqual(occupied.read_text(encoding="utf-8"), "前一本正文")
                 self.assertEqual(list((config.input_dir / ".rewrite-processing").glob("*/*.txt")), [])
                 self.assertNotIn(source, service.retry_queue)
                 occupied.unlink()
@@ -3958,7 +3962,7 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual(len(list(config.output_dir.glob("小说.__rw_*.txt"))), 1)
 
-    def test_rewrite_waits_for_same_title_in_configured_final_output(self):
+    def test_rewrite_recycles_only_expired_same_title_in_configured_final_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = self.rewrite_config(root)
@@ -3968,21 +3972,36 @@ class PipelineTests(unittest.TestCase):
             source.write_text("原始正文", encoding="utf-8")
             existing = complete / "小说.mp3"
             existing.write_bytes(b"older audio")
+            unrelated = complete / "另一本.txt"
+            unrelated.write_text("其他旧成品", encoding="utf-8")
+            file_time = existing.stat()
+            created_or_modified = max(file_time.st_mtime, getattr(file_time, "st_birthtime", file_time.st_mtime))
+            expires_at = created_or_modified + 24 * 60 * 60
             service = rewrite_monitor.MonitorService(
                 config, logging.getLogger("test-final-output-wait"), lambda *_: None, lambda *_: None
             )
             service.voice_output_dir = complete
-            with patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
+            with patch.object(file_utils.time, "time", return_value=expires_at) as clock, \
+                 patch.object(rewrite_monitor, "wait_until_stable", return_value=True), \
                  patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
                  patch.object(rewrite_processor, "send_file"):
                 service.process_once(source)
                 self.assertTrue(source.exists())
                 self.assertEqual(existing.read_bytes(), b"older audio")
                 self.assertNotIn(source, service.retry_queue)
-                existing.unlink()
+                clock.return_value = expires_at + 1
+                with patch.object(Path, "rename", side_effect=PermissionError("file in use")):
+                    service.process_once(source)
+                self.assertTrue(source.exists())
+                self.assertEqual(existing.read_bytes(), b"older audio")
+                self.assertNotIn(source, service.retry_queue)
                 service.process_once(source)
 
             self.assertFalse(source.exists())
+            self.assertFalse(existing.exists())
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "其他旧成品")
+            archived, = (complete / file_utils.EXPIRED_OUTPUT_DIR).glob("*/小说.mp3")
+            self.assertEqual(archived.read_bytes(), b"older audio")
             self.assertEqual(len(list(config.output_dir.glob("小说.__rw_*.txt"))), 1)
 
     def test_claimed_rewrite_waits_for_same_title_without_spending_retry(self):
@@ -4210,15 +4229,52 @@ class PipelineTests(unittest.TestCase):
             source.write_text("原始正文", encoding="utf-8")
             queue = {}
             stats = rewrite_runner.MonitorStats(started_at=datetime.now())
-            with patch.object(rewrite_runner, "wait_until_stable", return_value=True), \
+            with patch.object(rewrite_runner, "wait_until_stable", return_value=True) as stable, \
                  patch.object(rewrite_processor, "optimize_text", return_value="原始正文"), \
                  patch.object(rewrite_processor, "send_file"):
                 rewrite_runner._attempt(source, config, logging.getLogger("test-cli-name-wait"), queue, stats)
                 self.assertTrue(source.exists())
                 self.assertNotIn(source, queue)
-                existing.unlink()
-                rewrite_runner._attempt(source, config, logging.getLogger("test-cli-name-wait"), queue, stats)
+                stable.assert_not_called()
+                with patch.object(file_utils.time, "time", return_value=existing.stat().st_mtime + 25 * 60 * 60):
+                    rewrite_runner._attempt(source, config, logging.getLogger("test-cli-name-wait"), queue, stats)
             self.assertFalse(source.exists())
+            self.assertFalse(existing.exists())
+
+    def test_cli_keeps_recovered_book_queued_when_its_name_is_occupied(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            rewrite_root = project / "rewrite"
+            rewrite_root.mkdir()
+            config = self.rewrite_config(rewrite_root)
+            complete = project / "完成"
+            complete.mkdir()
+            occupied = complete / "a.mp3"
+            occupied.write_bytes(b"old audio")
+            source = config.input_dir / "a.txt"
+            source.write_text("待处理的原文", encoding="utf-8")
+            claimed = rewrite_processor.claim_source(source, config)
+            (config.input_dir / "b.txt").write_text("另一篇原文", encoding="utf-8")
+            processed = []
+
+            def process(path, *_args):
+                processed.append(path.name)
+                path.unlink()
+
+            def finish_round(_seconds):
+                if occupied.exists():
+                    self.assertEqual(processed, ["b.txt"])
+                    self.assertEqual(claimed.read_text(encoding="utf-8"), "待处理的原文")
+                    self.assertEqual(occupied.read_bytes(), b"old audio")
+                    occupied.unlink()
+                else:
+                    raise StopIteration
+
+            with patch.object(rewrite_runner, "process_file", side_effect=process), \
+                 patch.object(rewrite_runner.time, "sleep", side_effect=finish_round):
+                with self.assertRaises(StopIteration):
+                    rewrite_runner.run_monitor(config, logging.getLogger("test-cli-recovered-name-skip"))
+            self.assertEqual(processed, ["b.txt", "a.txt"])
 
     def test_invalid_banned_rules_cannot_overwrite_saved_gui_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4806,7 +4862,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual([path.name for path in complete.glob("*.mp3")], ["小说-第1章.mp3"])
             self.assertEqual((complete / "小说-第1章.txt").read_text(encoding="utf-8"), "新的正文")
 
-    def test_voice_waits_for_legacy_dated_output_and_existing_completed_txt(self):
+    def test_voice_recycles_expired_legacy_audio_and_same_name_completed_text(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             queue = root / "queue"
@@ -4827,14 +4883,42 @@ class PipelineTests(unittest.TestCase):
             processor = lambda path, active: voice_monitor.process_file(path, active, synthesize=synthesize)
             self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
             self.assertTrue(source.exists())
-            old_audio.unlink()
             old_text = complete / "小说.txt"
             old_text.write_text("旧正文", encoding="utf-8")
             self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 0)
             self.assertEqual(old_text.read_text(encoding="utf-8"), "旧正文")
-            old_text.unlink()
-            self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 1)
-            self.assertEqual(sorted(path.name for path in complete.iterdir()), ["小说.mp3", "小说.txt"])
+            with patch.object(file_utils.time, "time", return_value=old_text.stat().st_mtime + 25 * 60 * 60):
+                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 1)
+            recycled = complete / file_utils.EXPIRED_OUTPUT_DIR
+            archived_audio, = recycled.glob(f"*/{old_audio.name}")
+            archived_text, = recycled.glob("*/小说.txt")
+            self.assertEqual(archived_audio.read_bytes(), b"existing")
+            self.assertEqual(archived_text.read_text(encoding="utf-8"), "旧正文")
+            self.assertEqual(sorted(path.name for path in complete.iterdir() if path.is_file()), ["小说.mp3", "小说.txt"])
+            self.assertEqual(old_text.read_text(encoding="utf-8"), "新正文")
+
+    def test_voice_cannot_recycle_an_old_rewrite_source_from_overlapping_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue"
+            source_dir = root / "originals"
+            rewrite_dir = root / "rewrite"
+            for directory in (queue, source_dir, rewrite_dir):
+                directory.mkdir()
+            (rewrite_dir / "检测.txt").write_text(str(source_dir), encoding="utf-8")
+            queued = queue / "小说.txt"
+            queued.write_text("待配音正文", encoding="utf-8")
+            original = source_dir / queued.name
+            original.write_text("原始正文", encoding="utf-8")
+            config = voice_monitor.default_config()
+            config.update({"input_dir": str(queue), "output_dir": str(source_dir), "banned_rules_dir": str(rewrite_dir)})
+            with patch.object(file_utils.time, "time", return_value=original.stat().st_mtime + 25 * 60 * 60):
+                process = Mock()
+                self.assertEqual(voice_monitor.process_once(config, processor=process), 0)
+            process.assert_not_called()
+            self.assertEqual(original.read_text(encoding="utf-8"), "原始正文")
+            self.assertTrue(queued.exists())
+            self.assertFalse((source_dir / file_utils.EXPIRED_OUTPUT_DIR).exists())
 
     def test_unreadable_waiting_voice_file_does_not_stop_other_titles(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4862,7 +4946,9 @@ class PipelineTests(unittest.TestCase):
                 return True
 
             with patch.object(voice_monitor, "read_text", side_effect=read):
-                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=lambda *_: True), 1)
+                stable_checker = Mock(return_value=True)
+                self.assertEqual(voice_monitor.process_once(config, processor=processor, stable_checker=stable_checker), 1)
+                stable_checker.assert_called_once_with(healthy, config["stable_seconds"])
             self.assertTrue(broken.exists())
             self.assertFalse(healthy.exists())
 
@@ -5010,6 +5096,9 @@ class PipelineTests(unittest.TestCase):
                 "output_path": str(relative_audio), "completed_text_path": str(relative_text),
                 "audio_ready": True, "audio_sha256": voice_monitor.audio_sha256(audio),
             })
+            with patch.object(file_utils.time, "time", return_value=audio.stat().st_mtime + 25 * 60 * 60):
+                self.assertIsNone(voice_monitor.existing_output_for(source, config, recycle_expired=True))
+            self.assertTrue(audio.is_file())
             async def unexpected_synthesis(*_args):
                 self.fail("已有音频不应重合成")
             result = voice_monitor.process_file(source, config, synthesize=unexpected_synthesis)
@@ -5372,6 +5461,54 @@ class PipelineTests(unittest.TestCase):
             claim.assert_not_called()
             process.assert_not_called()
             self.assertTrue(source.exists())
+
+    def test_rewrite_monitor_skips_occupied_titles_before_using_workers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.rewrite_config(root)
+            complete = root / "complete"
+            complete.mkdir()
+            blocked = (config.input_dir / "a.txt", config.input_dir / "b.txt")
+            ready = config.input_dir / "c.txt"
+            for path in (*blocked, ready):
+                path.write_text("原文", encoding="utf-8")
+            old_audio = complete / "a.mp3"
+            old_audio.write_bytes(b"old audio")
+            queued_text = config.output_dir / "b.txt"
+            queued_text.write_text("已改正文", encoding="utf-8")
+            release = threading.Event()
+            finished = threading.Event()
+            processed = []
+
+            def stable(path, _seconds):
+                return release.wait(5) if path in blocked else True
+
+            def process(path, *_args, **_kwargs):
+                processed.append(path.name)
+                path.unlink()
+                return config.output_dir / path.name
+
+            service = rewrite_monitor.MonitorService(
+                config, logging.getLogger("test-rewrite-name-skip"), lambda *_: None, lambda *_: None,
+                on_result=lambda success: finished.set() if success else None,
+                voice_output_dir=complete,
+            )
+            with patch.object(rewrite_monitor, "wait_until_stable", side_effect=stable) as stability, \
+                 patch.object(rewrite_monitor, "process_file", side_effect=process):
+                service.start()
+                try:
+                    self.assertTrue(finished.wait(2), "无冲突的书应在前两本同名占用时继续处理")
+                finally:
+                    release.set()
+                    service.stop()
+                stability.assert_called_once_with(ready, config.stable_seconds)
+
+            self.assertEqual(processed, [ready.name])
+            self.assertEqual([path.read_text(encoding="utf-8") for path in blocked], ["原文", "原文"])
+            self.assertEqual(old_audio.read_bytes(), b"old audio")
+            self.assertEqual(queued_text.read_text(encoding="utf-8"), "已改正文")
+            self.assertEqual(service.stats.failed_total, 0)
+            self.assertFalse(service.retry_queue)
 
     def test_rewrite_monitor_processes_two_books_in_parallel(self):
         with tempfile.TemporaryDirectory() as temporary:

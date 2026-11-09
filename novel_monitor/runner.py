@@ -63,6 +63,13 @@ def _attempt(
         return
     try:
         load_banned_rules(config.root)
+        conflict = rewrite_name_conflict(
+            path, config.input_dir, config.output_dir, configured_voice_output_dir(config.root),
+            recycle_logger=logger,
+        )
+        if conflict:
+            logger.debug("同名文件仍在，跳过本书：%s（占用：%s）", path.name, conflict)
+            return
         if not is_claimed_source(path, config):
             if not wait_until_stable(path, config.stable_seconds):
                 logger.warning("文件消失或无法稳定: %s", path)
@@ -71,22 +78,16 @@ def _attempt(
                 if not acquired:
                     return
                 conflict = rewrite_name_conflict(
-                    path, config.input_dir, config.output_dir, configured_voice_output_dir(config.root)
+                    path, config.input_dir, config.output_dir, configured_voice_output_dir(config.root),
+                    recycle_logger=logger,
                 )
                 if conflict:
-                    logger.debug("同名文件仍在，改写等待：%s（占用：%s）", path.name, conflict)
+                    logger.debug("同名文件仍在，跳过本书：%s（占用：%s）", path.name, conflict)
                     return
                 try:
                     path = claim_source(path, config)
                 except FileNotFoundError:
                     return
-        else:
-            conflict = rewrite_name_conflict(
-                path, config.input_dir, config.output_dir, configured_voice_output_dir(config.root)
-            )
-            if conflict:
-                logger.debug("同名文件仍在，改写等待：%s（占用：%s）", path.name, conflict)
-                return
         stats.mark_started(path.name)
         _log_status(config, logger, stats)
         process_file(path, config, logger)
@@ -132,9 +133,9 @@ def run_monitor(config: AppConfig, logger: logging.Logger) -> None:
     _log_status(config, logger, stats)
     for path in recover_claimed_sources(config):
         state = load_retry_state(path, config)
-        if state.get("next_retry_at", 0) > time.time():
-            retry_queue[path] = RetryItem(path, state["attempts"], state["next_retry_at"])
-        else:
+        item = RetryItem(path, state.get("attempts", 0), state.get("next_retry_at", 0))
+        retry_queue[path] = item
+        if should_retry(item, time.time()):
             _attempt(path, config, logger, retry_queue, stats)
     while True:
         now = time.time()

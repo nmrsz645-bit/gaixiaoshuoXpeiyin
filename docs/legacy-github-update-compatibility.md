@@ -1,6 +1,6 @@
 # GitHub Latest 兼容入口与最新程序版本
 
-最新正式程序为 **1.0.30**，下载使用指定 [v1.0.30 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.30)。**GitHub Latest 标记保留给 v1.0.18 旧客户端更新兼容入口，不能据 Latest 标记判断当前程序最新版。**
+最新正式程序为 **1.0.31**，下载使用指定 [v1.0.31 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.31)。**GitHub Latest 标记保留给 v1.0.18 旧客户端更新兼容入口，不能据 Latest 标记判断当前程序最新版。**
 
 ## 已核实依据
 
@@ -17,4 +17,4 @@
 - 后续 GitHub 正式包补传先使用 `--latest=false`，保持上述旧入口不变；不要默认把较大版本设为 Latest。
 - 若确需迁移旧客户端 GitHub 更新通道，必须单独获得生产授权，核清旧客户端版本/配置、更新清单/载荷兼容性、升级回滚及数据保护，再执行。
 - 1.0.19 及之后使用现有 OSS 通道；本轮 OSS 清单、程序文件和下载站未改。
-- 根 version.json 与显示回退仍为当前正式 1.0.30；旧客户端兼容标记与程序版本、不可变包标签及最新维护提交必须分开记录。
+- 根 version.json 与显示回退仍为当前正式 1.0.31；旧客户端兼容标记与程序版本、不可变包标签及最新维护提交必须分开记录。

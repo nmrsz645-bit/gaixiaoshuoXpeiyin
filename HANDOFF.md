@@ -1,17 +1,17 @@
-# 下一位 Codex：小说处理中心 1.0.30
+# 下一位 Codex：小说处理中心 1.0.31
 
 > 新 Windows 接手、环境、构建、版本、OSS/网站、验收回滚和凭据：**[完整发布指南](docs/RELEASE-GUIDE.md)**。
 
-更新日期：2026-10-31。先读本文件、README 和 AGENTS，再核对远端实际状态；旧文档中的盘符、版本或历史测试数字不作为当前依据。
+更新日期：2026-11-10。先读本文件、README 和 AGENTS，再核对远端实际状态；旧文档中的盘符、版本或历史测试数字不作为当前依据。
 
 ## 用途、版本与仓库关系
 
 - 用途：Windows 本地 TXT 改写/可选场景审改、企业微信发送、Edge/阿里云配音和可恢复文件队列。
-- 本分支版本：**1.0.30，正式版**；目标仓库 `nmrsz645-bit/gaixiaoshuoXpeiyin`，分支 `main`，发布标签 `v1.0.30`。
-- 本公开仓库 main 维护正式版 1.0.30；测试版单独维护，不得误标稳定版或擅自公开私有新增源码。
+- 本分支版本：**1.0.31，正式版**；目标仓库 `nmrsz645-bit/gaixiaoshuoXpeiyin`，分支 `main`，发布标签 `v1.0.31`。
+- 本公开仓库 main 维护正式版 1.0.31；测试版单独维护，不得误标稳定版或擅自公开私有新增源码。
 - 原始构建源提交：`ad6c3aa3f32139102c55630cb6017d2c45bb8018`。正式版的发布记录基础提交为 `3260809b9fc1a2f31a4ff675ddca214a103443ce`；测试版在该基础上演进。
-- 本次只补齐 GitHub 源码、文档和 Release，沿用已有 Windows 包，不重新生成同版本包。最终发布源码提交以 `git rev-parse v1.0.30^{commit}` 及 Release 标签为准；对照核验记录的源提交和逐模块包内代码核对。
-- 当前正式源码根 `version.json` 与 `unified_app.DEFAULT_APP_VERSION` 均为 1.0.30。`read_app_version` 先读取源码/安装目录的该文件，缺失或损坏时才用回退值；便捷构建批处理会复制该文件，Python 构建工具则用显式 `--version` 写入包版本。原 v1.0.30 标签的开发元数据曾为 1.0.26，后续源码维护修正了显示元数据，不重打标签、不替换已发布程序。
+- 1.0.31 基于公开 main 的 1.0.30 维护源码。发布源码提交用 `git rev-parse v1.0.31^{commit}` 核对。变更、测试和包约定见 [1.0.31 发布说明](docs/releases/2026-11-10-v1.0.31.md)。
+- 当前正式源码根 `version.json` 与 `unified_app.DEFAULT_APP_VERSION` 均为 1.0.31。`read_app_version` 先读取源码/安装目录的该文件，缺失或损坏时才用回退值；便捷构建批处理会复制该文件，Python 构建工具则用显式 `--version` 写入包版本。原 v1.0.30 标签的开发元数据曾为 1.0.26，后续源码维护修正了显示元数据，不重打标签、不替换已发布程序。
 
 ## 架构与关键入口
 
@@ -20,7 +20,7 @@
 | `unified_app.py` | Tkinter 设置/状态/日志、DailyStats、UnifiedService、启动停止、自动恢复及更新入口。先看 ensure_app_files、UnifiedService.start 和 check_for_updates。 |
 | `runtime.py` / `credential_store.py` | 打包/源码运行目录、HTTPS 证书定位、Windows DPAPI 凭据保护。 |
 | `novel_monitor/config.py` | 改写配置、路径、接口 URL、领取时模式配置。 |
-| `novel_monitor/monitor_service.py` | 两线程改写调度、稳定文件判定、同名等待与重试节奏。 |
+| `novel_monitor/monitor_service.py` | 两线程改写调度、分派前跳过同名占用、领取前复查与重试。 |
 | `novel_monitor/file_utils.py` | 原始文件名关联、rewrite_name_conflict、完成文件保护、原子发布辅助。 |
 | `novel_monitor/processor.py` | 领取事务、暂存改稿、发送凭据、恢复与发布到配音队列；排查重复发送先看这里。 |
 | `novel_monitor/deepseek_client.py` | API 协议、分段、失败段拆分与检查点、指定词规则。 |
@@ -68,14 +68,14 @@ cmd /c run_tests.bat
 ## 构建打包
 
 ```powershell
-.\.venv\Scripts\python.exe tools\build_github_release.py --version 1.0.30 --output C:\npc-builds\1.0.30-new
+.\.venv\Scripts\python.exe tools\build_github_release.py --version 1.0.31 --output C:\npc-builds\1.0.31-new
 ```
 
 输出目录必须不存在。`构建桌面版.bat` 是旧便捷入口，会写固定目录；可重复验收应使用上述带显式版本/新输出目录的 Python 工具。本轮保留原 Windows 文件，未重新构建同版本；NSIS 安装/覆盖/卸载没有在本轮对当前 Windows 用户环境执行。
 
 ## 发布和升级
 
-1. GitHub：读取远端 head/标签/Release，正常提交和 fast-forward 推送，拒绝覆盖他人改动；创建缺失版本标签、上传经审查的原始包和 SHA256SUMS。正式 v1.0.30 标为 stable；v1.0.31-beta 必须 prerelease 且不能设为 latest。
+1. GitHub：读取远端 head/标签/Release，正常提交和 fast-forward 推送，拒绝覆盖他人改动；创建缺失版本标签、上传经审查的原始包和 SHA256SUMS。正式 v1.0.31 标为 stable；v1.0.31-beta 必须 prerelease 且不能设为 latest。
 2. GitHub Actions 当前只离线测试/构建/保存 artifact，不上传 OSS 或切换生产清单；测试版 CI 还要明确运行 test_desktop_shortcut.py。
 3. 生产更新为单独工作：稳定版检查 OSS latest.json；不可变版本 ZIP → 公网完整哈希回读 → latest.js → latest.json 最后 → 网站/隔离升级回滚验收。必须另行明确授权，GitHub 发布不等于生产更新。
 4. 稳定版运行中可能静默检查并重启，生产复现前先核实版本和活动任务；测试版版本号带 `-` 时 check_for_updates 直接返回。
@@ -91,6 +91,8 @@ API Key/Webhook 以本地文件保存，应通过 GUI 管理。阿里云 AccessK
 
 - 已完成：1.0.30 固定行清理/7000 截断、备份和同名保护；已发送暂存稿不受新空正文阻断；场景复核并行及检查点恢复；测试版界面/快捷方式/安装源与对应离线回归。
 - 同名等待曾有用户反馈，现象后来已报告解除；未取得故障机完整日志，根因仍未独立确认，不能宣称修复了某个死锁。复现需保留版本、时刻、占用路径、任务 ID、retry.json/semantic-mode.json 和相关日志，先只读区分活动任务、延迟重试、重复入队和历史残留。
+- 2026-11-09 在 1.0.30 源码基线上复现队首两本同名占用时第三本拿不到线程。改写改在分派前筛掉占用书籍，领取仍复查。配音和命令行改写在等待文件稳定前检查占用，命令行恢复任务保留在队列以便下轮重查。Windows Python 3.13.15 执行 `run_tests.bat`，411 项离线测试通过。此记录对应本地源码修复，交付范围尚未包含程序包。
+- 同名成品超过 24 小时时，改写与配音先回收完成目录根级的占用 TXT 或 MP3，再复查同名。取创建和最后修改时间的较晚者。旧文件通过同盘改名移入 `.expired-name-conflicts` 的独立子目录，保留原名与内容。排队和处理中任务、配音回执拥有的成品、与源目录重叠的位置保留原位。回收失败时仍跳过该书。
 - 当前主要验证限制：外部 AI/语音服务的可用性、真实业务发送/配音、客户升级、平台审核结论，以及本轮新安装/覆盖/卸载的 Windows 用户环境行为均未验收。包内代码和 ZIP/安装程序载荷已静态核对，见核验记录。
 - 已知安装边界：NSIS 的同名进程检查作用于当前系统同名 EXE；不要在生产程序仍运行时做安装测试。安装/卸载涉及桌面、开始菜单及 HKCU 项，必须先隔离，不能仅靠 /D 新目录假定完全无副作用。
 - 下一次修改先确认具体目标和授权；队列/发送问题优先读 processor/file_utils/monitor_service，配音问题读 voice_monitor/aliyun_tts，场景行为读 scene_review/text_preparation，界面/安装问题读 beta 的 ui_theme/installer。每次以实际源码和测试证据更新本文件。
@@ -109,4 +111,4 @@ API Key/Webhook 以本地文件保存，应通过 GUI 管理。阿里云 AccessK
 
 ## GitHub Latest 生产兼容约束
 
-最新正式程序为 1.0.30，但 GitHub Latest 标记保留在 v1.0.18，因为旧更新器固定读取 releases/latest/download/latest.json。最新程序人工下载使用版本专属 v1.0.30 Release；新补传使用 --latest=false，迁移旧更新通道必须另核生产授权。旧入口已回读恢复原清单 SHA-256，细节见 [兼容入口](docs/legacy-github-update-compatibility.md)。
+最新正式程序为 1.0.31，但 GitHub Latest 标记保留在 v1.0.18，因为旧更新器固定读取 releases/latest/download/latest.json。最新程序人工下载使用版本专属 v1.0.31 Release；新补传使用 --latest=false，迁移旧更新通道必须另核生产授权。旧入口已回读恢复原清单 SHA-256，细节见 [兼容入口](docs/legacy-github-update-compatibility.md)。

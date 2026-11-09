@@ -1,4 +1,4 @@
-# 新 Windows 接手、构建与发布指南（1.0.30）
+# 新 Windows 接手、构建与发布指南（1.0.31）
 
 更新：2026-10-31。适用：`nmrsz645-bit/gaixiaoshuoXpeiyin` / `main`，公开正式源码。本次只补文档，未改程序/版本/包/标签/Release/OSS/网站，也未操作另一台电脑。
 
@@ -89,7 +89,7 @@ if ($LASTEXITCODE -ne 0) { throw '离线回归失败，禁止继续组包' }
 
 ```powershell
 $version = (Get-Content -LiteralPath .\version.json -Raw | ConvertFrom-Json).version
-if ($version -ne '1.0.30') { throw '先核对当前正式分支版本' }
+if ($version -ne '1.0.31') { throw '先核对当前正式分支版本' }
 $buildRoot = Join-Path 'C:\NPC-Releases' ('local-' + $version + '-' + [guid]::NewGuid().ToString('N'))
 & $py tools\build_github_release.py --version $version --output $buildRoot --notes '隔离本地构建，不替换既有发布'
 if ($LASTEXITCODE -ne 0) { throw '构建失败' }
@@ -153,7 +153,7 @@ UpdateAgent.exe --silent --check <updater-config.json的绝对路径>
 
 **1.0.31-beta 带 `-`，`check_for_updates()` 直接返回，不启动更新器，也不替代稳定通道。** 页面数字版本校验同样不接受 `-beta`。不要仅删除后缀来“转正式”。
 
-旧 v1.0.18 的更新器固定读取 GitHub `releases/latest/download/latest.json`，所以公开仓库 **Latest 必须保留 v1.0.18**。正式最新程序 1.0.30 使用[版本专属 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.30)。以后已授权的新 Release 使用 `--latest=false`；测试版另加 `--prerelease`。不要用默认 Latest 改变旧客户端入口。见 [旧通道兼容约束](legacy-github-update-compatibility.md)。
+旧 v1.0.18 的更新器固定读取 GitHub `releases/latest/download/latest.json`，所以公开仓库 **Latest 必须保留 v1.0.18**。正式程序 1.0.31 使用[版本专属 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.31)。新 Release 使用 `--latest=false`，测试版另加 `--prerelease`。见 [旧通道兼容约束](legacy-github-update-compatibility.md)。
 
 更新器是外部 **.NET Framework 4.x** 固定二进制：26112 字节，SHA-256 `59e3fd575350c274e2134168d7f61c3caca8ac61377570af92e5a559f54d1241`。应用打包只复用它，**尚未找回对应原始源码/工程/构建参数**，不能宣称全部组件可重建，也不能用其他产品同名 EXE 代替。详见 [更新器依赖缺口](updater-dependency.md)。
 
