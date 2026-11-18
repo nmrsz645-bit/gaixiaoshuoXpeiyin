@@ -71,7 +71,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.32-lux-test.1"
+DEFAULT_APP_VERSION = "1.0.32-lux-test.2"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -791,7 +791,7 @@ class App(tk.Tk):
         self.update_random_voice_summary()
         rows = (
             ("引擎", "engine"), ("Edge 音色", "voice"), ("Edge 语速", "rate"), ("Edge 语调", "pitch"), ("Edge 音量", "volume"),
-            ("LuxTTS 运行目录", "lux_runtime_dir"), ("LuxTTS 语速（0.5～2.0 倍）", "lux_speed"),
+            ("LuxTTS 运行目录（留空自动）", "lux_runtime_dir"), ("LuxTTS 语速（0.5～2.0 倍）", "lux_speed"),
         )
         variables = {"engine": self.engine, "voice": self.voice_name, "rate": self.rate, "pitch": self.pitch,
                      "volume": self.volume, "lux_runtime_dir": self.lux_runtime_dir, "lux_speed": self.lux_speed}
@@ -813,7 +813,7 @@ class App(tk.Tk):
         ttk.Button(random_row, text="选择随机音色", command=self.choose_random_voices).pack(side="left", padx=8)
         ttk.Label(random_row, textvariable=self.random_voice_summary).pack(side="left")
         ttk.Button(page, text="LuxTTS 音色与声音克隆", command=self.open_lux_voice_manager).grid(row=8, column=1, sticky="w", pady=5)
-        ttk.Label(page, text="LuxTTS 的音色、随机名单和克隆样音在此单独管理。1.0 倍为正常速度。", wraplength=640).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="完整包的运行目录留空即可，自动使用随包模型。音色、随机名单和克隆样音在此单独管理；1.0 倍为正常速度。", wraplength=640).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Label(page, text="配音完成输出目录").grid(row=10, column=0, sticky="w", pady=5)
         ttk.Entry(page, textvariable=self.output_dir, width=58).grid(row=10, column=1, sticky="ew", pady=5)
         ttk.Button(page, text="选择文件夹", command=self.choose_output_dir).grid(row=10, column=2, padx=(6, 0), pady=5)
@@ -1128,6 +1128,9 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    if "--lux-portable-check" in sys.argv:
+        from lux_portable_check import main as check_lux_portable
+        raise SystemExit(check_lux_portable(sys.argv[1:]))
     if not acquire_single_instance():
         if "--guard" not in sys.argv:
             ctypes.windll.user32.MessageBoxW(None, "小说处理中心已经在运行。", "无法重复启动", 0x40)

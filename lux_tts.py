@@ -17,6 +17,8 @@ import tempfile
 import threading
 import wave
 
+import runtime
+
 
 VOICE_CODES = ("zh-CN-XiaoyiNeural", "zh-CN-XiaoxiaoNeural")
 RUN_LOCK = threading.Lock()
@@ -37,10 +39,7 @@ def digest(path):
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
-def runtime_paths(directory):
-    if not directory:
-        raise ValueError("请先选择本机 LuxTTS 运行环境目录。")
-    root = Path(directory).expanduser().resolve(strict=True)
+def _runtime_paths_at(root):
     if root.name.casefold() == "app" and (root.parent / "runtime").is_dir():
         root = root.parent
     workers = (root / "app/voice/lux_worker.py", root / "voice/lux_worker.py")
@@ -48,8 +47,27 @@ def runtime_paths(directory):
     python = root / "runtime/game-ocr/py312/python.exe"
     engine = root / "runtime/lux-tts"
     if worker is None or not python.is_file() or not engine.is_dir():
-        raise ValueError("所选目录缺少破甲 LuxTTS 的 Python、工作进程或模型。")
+        raise ValueError("LuxTTS 运行目录缺少 Python、工作进程或模型。")
     return root, python, worker, engine
+
+
+def runtime_paths(directory=None):
+    """Resolve portable assets on each use; an empty setting means bundled runtime."""
+    base = Path(runtime.BASE_DIR).resolve()
+    if directory is None or isinstance(directory, str) and not directory.strip():
+        for candidate in (base.parent / "lux-runtime", base / "lux-runtime"):
+            try:
+                return _runtime_paths_at(candidate.resolve(strict=True))
+            except (OSError, ValueError):
+                continue
+        raise ValueError("未找到随包 LuxTTS 运行环境，请完整解压测试包并保留 lux-runtime 目录，或选择完整运行环境目录。")
+    root = Path(directory).expanduser()
+    if not root.is_absolute():
+        root = base / root
+    try:
+        return _runtime_paths_at(root.resolve(strict=True))
+    except OSError as error:
+        raise ValueError("所选 LuxTTS 运行环境目录不存在或不可访问。") from error
 
 
 def reference_profile(config):

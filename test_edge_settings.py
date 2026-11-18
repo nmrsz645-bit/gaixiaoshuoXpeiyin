@@ -173,7 +173,7 @@ class EdgeSettingsTests(unittest.TestCase):
             unified_app.App._build_voice_tab(app, Mock())
         self.assertEqual(combo.call_args_list[0].kwargs["values"], ("edge", "edge_then_lux", "lux_tts"))
         texts = [call.kwargs.get("text", "") for call in label.call_args_list]
-        self.assertIn("LuxTTS 运行目录", texts)
+        self.assertIn("LuxTTS 运行目录（留空自动）", texts)
         self.assertIn("LuxTTS 语速（0.5～2.0 倍）", texts)
         self.assertFalse(any("阿里云" in text for text in texts))
         self.assertIn("LuxTTS 音色与声音克隆", [call.kwargs.get("text", "") for call in button.call_args_list])

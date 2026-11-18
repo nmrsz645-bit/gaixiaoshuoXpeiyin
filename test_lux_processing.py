@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 import tempfile
@@ -15,6 +16,71 @@ def valid_mp3():
 
 
 class LuxProcessingTests(unittest.TestCase):
+    @staticmethod
+    def make_runtime(root, worker_directory="voice"):
+        worker = root / worker_directory / "lux_worker.py"
+        python = root / "runtime/game-ocr/py312/python.exe"
+        engine = root / "runtime/lux-tts"
+        worker.parent.mkdir(parents=True, exist_ok=True)
+        python.parent.mkdir(parents=True, exist_ok=True)
+        engine.mkdir(parents=True, exist_ok=True)
+        worker.write_bytes(b"# isolated runtime fixture")
+        python.write_bytes(b"isolated python fixture")
+        return root, python, worker, engine
+
+    def test_portable_runtime_relocates_with_package_and_ignores_working_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "original-package"
+            app = package / "test-app"
+            app.mkdir(parents=True)
+            expected = self.make_runtime(package / "lux-runtime")
+            other = root / "unrelated-working-directory"
+            other.mkdir()
+            with contextlib.chdir(other), patch.object(lux_tts.runtime, "BASE_DIR", app):
+                for setting in (None, "", "   "):
+                    self.assertEqual(lux_tts.runtime_paths(setting), expected)
+            relocated = root / "搬移后的完整包"
+            package.rename(relocated)
+            with contextlib.chdir(other), patch.object(lux_tts.runtime, "BASE_DIR", relocated / "test-app"):
+                paths = lux_tts.runtime_paths("")
+                self.assertEqual(paths[0], relocated / "lux-runtime")
+                self.assertTrue(all(path.exists() for path in paths))
+                self.assertNotIn(str(package), str(paths))
+
+    def test_portable_runtime_can_be_inside_app_when_sibling_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "test-app"
+            expected = self.make_runtime(app / "lux-runtime")
+            (root / "lux-runtime").mkdir()
+            with patch.object(lux_tts.runtime, "BASE_DIR", app):
+                self.assertEqual(lux_tts.runtime_paths(""), expected)
+                sibling = self.make_runtime(root / "lux-runtime")
+                self.assertEqual(lux_tts.runtime_paths(""), sibling)
+
+    def test_explicit_runtime_takes_precedence_and_legacy_app_layout_still_works(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "test-app"
+            app.mkdir()
+            self.make_runtime(root / "lux-runtime")
+            expected = self.make_runtime(root / "external", "app/voice")
+            with patch.object(lux_tts.runtime, "BASE_DIR", app):
+                self.assertEqual(lux_tts.runtime_paths(root / "external"), expected)
+                self.assertEqual(lux_tts.runtime_paths(root / "external/app"), expected)
+                self.assertEqual(lux_tts.runtime_paths("../external"), expected)
+
+    def test_missing_portable_runtime_reports_complete_package_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "test-app"
+            app.mkdir()
+            with patch.object(lux_tts.runtime, "BASE_DIR", app):
+                with self.assertRaisesRegex(ValueError, "完整解压.*lux-runtime"):
+                    lux_tts.runtime_paths("")
+                with self.assertRaisesRegex(ValueError, "不存在或不可访问"):
+                    lux_tts.runtime_paths(app / "missing")
+
     def test_removed_engines_migrate_in_memory_without_rewriting_old_secrets(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"

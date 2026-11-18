@@ -1,0 +1,45 @@
+{
+  "source_root": "D:\\AILiveRelease\\qa-ailive-gpu109-b22c3bee\\ailive-independent\\runtime\\lux-tts",
+  "verified": [
+    {
+      "file": "weights/luxtts/fm_decoder.onnx",
+      "bytes": 477534010,
+      "sha256": "4510d4f5f049f14ef80207fca695e13c820e2cea61635f402954950bc62b1e3c",
+      "official_metadata": "LuxTTS-model-metadata.json",
+      "revision": "527f245a276a0eb42ea103a7a512bcfd771eb9b6",
+      "matches": true
+    },
+    {
+      "file": "weights/luxtts/model.pt",
+      "bytes": 491318136,
+      "sha256": "745855037478eb888cfa7a3603c1aa9f663f22a72d94cc1c37787228ff422095",
+      "official_metadata": "LuxTTS-model-metadata.json",
+      "revision": "527f245a276a0eb42ea103a7a512bcfd771eb9b6",
+      "matches": true
+    },
+    {
+      "file": "weights/luxtts/text_encoder.onnx",
+      "bytes": 17633735,
+      "sha256": "495eca2d5f8a911f5c361bcce5bd55cdd2508ccdd26ce3e9bf1d3c29eb974861",
+      "official_metadata": "LuxTTS-model-metadata.json",
+      "revision": "527f245a276a0eb42ea103a7a512bcfd771eb9b6",
+      "matches": true
+    },
+    {
+      "file": "weights/luxtts/vocoder/vocos.bin",
+      "bytes": 63972079,
+      "sha256": "116b9875a0369d6a0156d752b4548121fe75fdc81d39943e81c46ac9bfa72d11",
+      "official_metadata": "LuxTTS-model-metadata.json",
+      "revision": "527f245a276a0eb42ea103a7a512bcfd771eb9b6",
+      "matches": true
+    },
+    {
+      "file": "weights/whisper-tiny/model.safetensors",
+      "bytes": 290403936,
+      "sha256": "07cadb9f25677c8d50df603e66a98fbd842cce45047139baeb16e6219a1e807b",
+      "official_metadata": "Whisper-base-model-metadata.json",
+      "revision": "e37978b90ca9030d5170a5c07aadb050351a65bb",
+      "matches": true
+    }
+  ]
+}

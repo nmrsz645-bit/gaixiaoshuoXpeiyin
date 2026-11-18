@@ -1,4 +1,6 @@
-# 小说处理中心 1.0.32-lux-test.1
+# 小说处理中心 1.0.32-lux-test.2
+
+当前完整测试包已增加随包 LuxTTS 模型、CPU/GPU 运行环境与离线自检入口。解压后运行目录留空即可自动发现，无需安装或选择破甲。构建和迁移验证见 [完整测试包记录](docs/LUX-PORTABLE-20261118.md)。
 
 当前分支是 2026-11-18 的 LuxTTS 功能测试候选。支持 Edge、本地 LuxTTS，以及 Edge 失败后转本地 LuxTTS。两种服务默认均从晓伊、晓晓选一位，LuxTTS 支持 0.5～2 倍语速、私人声音克隆和试听。阿里云配音功能已移除。先读 [本次功能记录](docs/LUX-VOICE-20261118.md)，此前 Edge 修复见 [Edge 记录](docs/EDGE-REPAIR-20261118.md)。以下历史正式发布资料对应 1.0.31。
 
@@ -14,7 +16,7 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 - 本公开仓库维护正式版源码；测试版单独维护，不能误标为稳定版或擅自公开测试源码。
 - 正式版为 **1.0.31**。本版包含同名跳过、超过 24 小时的同名成品回收和自动流程页提示。GitHub Release 与 OSS 客户端更新分别验证。
 - 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [1.0.31 变更说明](docs/releases/2026-11-10-v1.0.31.md)。
-- 当前测试分支根 `version.json` 和源码显示回退值均为 **1.0.32-lux-test.1**。测试构建显式传 `--version 1.0.32-lux-test.1`，带测试后缀的版本跳过更新器安装与检查。以下正式版流程示例仍使用 1.0.31，原 Windows 包和标签保持不变。
+- 当前测试分支根 `version.json` 和源码显示回退值均为 **1.0.32-lux-test.2**。测试构建显式传 `--version 1.0.32-lux-test.2`，带测试后缀的版本跳过更新器安装与检查。以下正式版流程示例仍使用 1.0.31，原 Windows 包和标签保持不变。
 
 ## GitHub Latest 兼容约束
 
@@ -37,7 +39,7 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 | AI 接口 | 在“改小说设置”选 DeepSeek 官方或自定义服务，填写本人有权使用的 API Key、完整接口 URL 和模型并保存。DeepSeek Key 在其[平台控制台](https://platform.deepseek.com/)创建；自定义接口由对应供应商提供。默认 URL 为 `https://api.deepseek.com/chat/completions`，默认模型 `deepseek-v4-flash`，每次最多 8000 字、等待 300 秒。 |
 | 企业微信 | 在本人有管理权限的群内添加机器人，取得 Webhook 并填入“改小说设置”。改写流程启动会校验 Key 和 Webhook；接口测试会真实向机器人发送消息。获取方式参见[企业微信群机器人文档](https://developer.work.weixin.qq.com/document/path/91770)。 |
 | Edge 语音 | “配音设置”选 `edge`，保存音色、语速、音量和音调，使用在线 Edge 服务。 |
-| 本地 LuxTTS | 选 `lux_tts`，或选 `edge_then_lux` 作为 Edge 失败后的备用。选择破甲 GPU+CPU 完整包解压目录，设置 0.5～2.0 倍语速。通过“LuxTTS 音色与声音克隆”导入私人参考音频或选择默认两种参考音色。 |
+| 本地 LuxTTS | 选 `lux_tts`，或选 `edge_then_lux` 作为 Edge 失败后的备用。完整测试包的运行目录留空即自动使用随包模型，语速可设 0.5～2.0 倍。通过“LuxTTS 音色与声音克隆”导入私人参考音频或选择默认两种参考音色。 |
 | 目录与规则 | 默认输入 `待改小说`，改写输出/配音输入必须同为 `已改完成`，最终输出 `完成`。在对应设置页保存目录、审改开关和指定违禁词。 |
 
 AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_webhook_url.txt`；语音配置在 `app/config.json`，改写配置在 `app/改写/config.json`。私人克隆音色存于 `app/lux-custom-voices`，迁移时需连同参考音频和元数据保存。配置、规则、日志、正文和回执均属于用户本地数据，不随 Git 或 Release 分发。
