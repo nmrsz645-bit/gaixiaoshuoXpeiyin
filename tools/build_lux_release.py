@@ -25,6 +25,12 @@ CLIENT_MANIFEST_LIMIT = 1024 * 1024
 RUNTIME_MAP_NAME = "lux-runtime/完整文件清单.json"
 LEGACY_CERTIFICATE = "_internal/aliyunsdkcore/vendored/requests/packages/certifi/cacert.pem"
 PRIMARY_CERTIFICATE = "_internal/certifi/cacert.pem"
+REQUIRED_RUNTIME_STUBS = (
+    "runtime/lux-tts/deps/librosa/__init__.pyi",
+    "runtime/lux-tts/deps/librosa/core/__init__.pyi",
+    "runtime/lux-tts/deps/librosa/feature/__init__.pyi",
+    "runtime/lux-tts/deps/librosa/util/__init__.pyi",
+)
 KEY_RUNTIME_FILES = (
     "voice/lux_worker.py",
     "runtime/game-ocr/py312/python.exe",
@@ -36,18 +42,16 @@ KEY_RUNTIME_FILES = (
     "runtime/lux-tts/weights/luxtts/text_encoder.onnx",
     "runtime/lux-tts/weights/luxtts/vocoder/vocos.bin",
     "runtime/lux-tts/weights/whisper-tiny/model.safetensors",
+    *REQUIRED_RUNTIME_STUBS,
 )
 RUNTIME_PRUNING_RULES = [
     "runtime/lux-tts/{deps,gpu-deps}/torch/include/**",
-    "**/*.pyi",
     "runtime/lux-tts/{deps,gpu-deps}/transformers/models/**/convert_*.py",
 ]
 
 
 def inference_only_excluded(name):
     """Remove only development artifacts unused by the verified worker."""
-    if name.casefold().endswith(".pyi"):
-        return True
     prefix = "lux-runtime/runtime/lux-tts/"
     if not name.startswith(prefix):
         return False
@@ -115,12 +119,14 @@ def runtime_entries(source, notices):
     excluded = [entry for entry in entries if inference_only_excluded(entry.name)]
     entries = [entry for entry in entries if not inference_only_excluded(entry.name)]
     names = {entry.name for entry in entries}
+    if any("lux-runtime/" + name not in names for name in REQUIRED_RUNTIME_STUBS):
+        raise ValueError("Required librosa runtime stub is missing.")
     if any("lux-runtime/" + name not in names for name in KEY_RUNTIME_FILES):
         raise ValueError("Critical LuxTTS runtime files are missing.")
     portable.validate_entries(entries)
     return entries, dict(rules=RUNTIME_PRUNING_RULES, excluded_files=len(excluded),
                          excluded_bytes=sum(entry.size for entry in excluded),
-                         note="Only C++ headers, type stubs and Transformers conversion scripts are omitted. Models, inference code, native libraries, licenses and wheel RECORD metadata remain unchanged.")
+                         note="Only C++ headers and Transformers conversion scripts are omitted. All .pyi files are retained: librosa reads its lazy-loader stubs at runtime. Models, inference code, native libraries, licenses and wheel RECORD metadata remain unchanged.")
 
 
 def copy_compressed_member(source, target, original, name):

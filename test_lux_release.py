@@ -42,6 +42,8 @@ class LuxReleaseTests(unittest.TestCase):
         for name in release.KEY_RUNTIME_FILES:
             if name.startswith("runtime/lux-tts/"):
                 material[name] = b"Weight fixture" * 16
+        for name in release.REQUIRED_RUNTIME_STUBS:
+            material[name] = b"# Runtime lazy-loader stub fixture\n"
         for name, data in material.items():
             path = self.runtime / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,15 +131,17 @@ class LuxReleaseTests(unittest.TestCase):
 
     def test_inference_pruning_removes_only_requested_development_resources(self):
         result = self.build()
-        self.assertEqual(result["packaging"]["excluded_files"], 4)
+        self.assertEqual(result["packaging"]["excluded_files"], 3)
         with zipfile.ZipFile(self.args.output / "novel-processing-center-1.0.32-update.zip") as archive:
             names = archive.namelist()
-            self.assertFalse(any("/torch/include/" in name or name.endswith(".pyi")
-                                 or name.endswith("/convert_old.py") for name in names))
+            self.assertFalse(any("/torch/include/" in name or name.endswith("/convert_old.py") for name in names))
+            self.assertIn("lux-runtime/runtime/lux-tts/deps/torch/types.pyi", names)
             for name in ("code/zipvoice/__init__.py", "deps/transformers/models/fixture/modeling_fixture.py",
                          "deps/torch/torch_cpu.pyd", "deps/torch-1.dist-info/LICENSE", "deps/torch-1.dist-info/RECORD"):
                 self.assertIn("lux-runtime/runtime/lux-tts/" + name, names)
             for name in release.KEY_RUNTIME_FILES:
+                self.assertIn("lux-runtime/" + name, names)
+            for name in release.REQUIRED_RUNTIME_STUBS:
                 self.assertIn("lux-runtime/" + name, names)
             runtime_map = json.loads(archive.read(release.RUNTIME_MAP_NAME))
             self.assertIn("Only C++ headers", runtime_map["packaging"]["note"])
@@ -153,6 +157,12 @@ class LuxReleaseTests(unittest.TestCase):
             self.assertNotIn("使用说明.txt", update.namelist())
         manifest = json.loads((self.args.output / "latest.json").read_text(encoding="utf-8"))
         self.assertNotIn("使用说明.txt", manifest["files"])
+
+    def test_missing_librosa_lazy_loader_stub_is_rejected_before_packaging(self):
+        (self.runtime / release.REQUIRED_RUNTIME_STUBS[0]).unlink()
+        with self.assertRaisesRegex(ValueError, "librosa runtime stub"):
+            self.build()
+        self.assertFalse(self.args.output.exists())
 
 
 if __name__ == "__main__":
