@@ -30,7 +30,7 @@ class LuxProcessingTests(unittest.TestCase):
 
     def test_portable_runtime_relocates_with_package_and_ignores_working_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             package = root / "original-package"
             app = package / "test-app"
             app.mkdir(parents=True)
@@ -50,7 +50,7 @@ class LuxProcessingTests(unittest.TestCase):
 
     def test_current_app_runtime_takes_precedence_over_older_sibling_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             app = root / "test-app"
             expected = self.make_runtime(app / "lux-runtime")
             (root / "lux-runtime").mkdir()
@@ -61,7 +61,7 @@ class LuxProcessingTests(unittest.TestCase):
 
     def test_explicit_runtime_takes_precedence_and_legacy_app_layout_still_works(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             app = root / "test-app"
             app.mkdir()
             self.make_runtime(root / "lux-runtime")
