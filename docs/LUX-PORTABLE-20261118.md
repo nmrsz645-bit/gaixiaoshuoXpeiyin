@@ -34,4 +34,17 @@ python tools/build_github_release.py --version 1.0.32-lux-test.2 --output <新�
 python tools/build_lux_portable.py --app-archive <应用输出目录/novel-processing-center-1.0.32-lux-test.2-windows-x64.zip> --runtime-source 'D:\AILiveRelease\qa-ailive-gpu109-b22c3bee\ailive-independent' --output <新的完整包输出目录> --guide-file <使用说明文件> --notices-directory third_party/lux
 ```
 
-使用离线回归以及完整解压后的冻结程序自检验证。后续补充本次真实产物的大小、哈希和 GPU/CPU 结果；它们不能替代另一台电脑的现场验收。
+## 实际交付与验证
+
+应用源码提交 `912f0f60e8c5a0ab9af9989bfa86e6a768603376`。完整包为 `novel-processing-center-1.0.32-lux-test.2-luxtts-full-test-windows-x64.zip`，交付时另复制为桌面 `小说处理中心-LuxTTS完整测试包-20261118.zip`。
+
+- 压缩包 4,877,667,905 字节；SHA-256 `524c621c86af3b6791a9ceee8431dead9866c2fa5be4a2276a2e72e03276dbb1`。
+- 27,062 个有效载荷文件，7,435,812,663 字节，另有包内清单。实际完整解压后逐文件大小与哈希全部匹配，清单哈希 `2e6274bd72712f88e5984b3f5fd30a561bcfcd8d52bc56f36775260109e85573`。
+- 473 项离线回归通过，含 9 项小文件真实构建/校验夹具。文件白名单、配置拒绝、路径逃逸、重复项、缓存/OCR 排除及篡改检查均覆盖。
+- 完整解压后从“初始解压”改名搬到 `C:\Projects\novel-lux-portable-qa-20261118\搬移后 测试`，从它的父目录运行冻结 EXE，PATH 仅保留 Windows System32，使用新建空白用户环境目录。七个应用模块的冻结代码与本次源码重新编译结果一致。
+- 默认 auto 模式分别生成晓伊、晓晓 MP3，合计 110.51 秒；强制 CPU、禁用可见 CUDA 的晓伊测试 42.91 秒；强制 CUDA 的晓晓测试 54.45 秒。每份 MP3 96,524 字节、约八秒，均在编码后严格解码通过。这些数字包含各次冷加载，不作为长小说吞吐量对比。
+- CPU 为 i5-14600KF，GPU 为 RTX 5060 Ti。实际工作进程和模型路径全部来自搬移后的 `lux-runtime`。没有创建业务 `config.json`、业务队列或更新器目录，EXE 哈希保持 `9390647159afba4d094de4b6aaa51e4760f1dafc7d415b03d803a102ff68be20`。
+
+构建与实际验证证据在本机 `C:\Projects\novel-edge-repair-20261118\evidence\lux-portable-*`，完整构建清单在 `build-lux-portable-full`。桌面另外提供使用说明和校验结果。源码与说明只在本地提交，未推送、发布 Release、上传 OSS 或改客户端更新清单，原安装和真实任务未动。
+
+未验证：另一台实体电脑的硬件、驱动及 GUI 现场表现；新参考音色整篇小说逐字漏读核验。此前整篇合成与克隆结果仍见 Lux 功能记录。本轮桌面截图工具的限制见此前记录，不能把 CLI 自检视作设置页视觉验收。实际解压自检可重复执行，不能替代另一台电脑的现场验收。
