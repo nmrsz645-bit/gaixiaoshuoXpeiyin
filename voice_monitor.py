@@ -16,6 +16,7 @@ from pathlib import Path
 
 import runtime
 import aliyun_tts
+from edge_request_policy import EDGE_GATE, EdgeRequestDeferred, throttle_delay
 from novel_monitor.logging_setup import retained_file_handler
 from novel_monitor.file_utils import internal_queue_original_name, move_to_directory, recycle_expired_completed_file, same_title
 from novel_monitor.banned_rules_guard import banned_rules_guard
@@ -91,11 +92,11 @@ def default_config():
         "input_dir": str(BASE_DIR / "文本档"),
         "output_dir": str(BASE_DIR / "完成"),
         "voice": "zh-CN-XiaoxiaoNeural",
-        "engine": "edge_then_aliyun",
+        "engine": "edge",
         "use_random_voice": True,
         "random_voice_dir": str(BASE_DIR / "随机音色"),
         "preview_dir": str(BASE_DIR / "试听"),
-        "random_voices": ALL_CHINESE_VOICES,
+        "random_voices": ["zh-CN-XiaoyiNeural", "zh-CN-XiaoxiaoNeural"],
         "rate": "+0%",
         "pitch": "+0Hz",
         "volume": "+0%",
@@ -784,13 +785,12 @@ def select_voice(config, chooser=random.choice):
     if not config.get("use_random_voice"):
         return config["voice"]
 
+    voices = [voice for voice in config.get("random_voices") or [] if voice in ALL_CHINESE_VOICES]
+    if voices:
+        return chooser(voices)
     numbered_voices = voices_from_number_files(config)
     if numbered_voices:
         return chooser(numbered_voices)
-
-    voices = config.get("random_voices") or []
-    if config.get("use_random_voice") and voices:
-        return chooser(voices)
     return config["voice"]
 
 
@@ -859,16 +859,31 @@ async def edge_synthesize(text, output_path, config):
 async def edge_synthesize_with_retry(text, output_path, config, synthesize_func=None, sleeper=asyncio.sleep):
     synthesize_func = synthesize_func or edge_synthesize
     retry_count = max(0, int(config.get("edge_retry_count", 3)))
-    for attempt in range(retry_count + 1):
-        try:
-            await synthesize_func(text, output_path, config)
-            return
-        except Exception:
-            if attempt >= retry_count:
-                raise
-            delay = 5 * (2 ** attempt)
-            logging.warning("Edge request was rejected; retrying in %s seconds (%s/%s).", delay, attempt + 1, retry_count)
-            await sleeper(delay)
+    # Keep one chosen voice for every attempt on this text.
+    fixed_config = dict(config, voice=select_voice(config), use_random_voice=False)
+    EDGE_GATE.acquire()
+    try:
+        for attempt in range(retry_count + 1):
+            try:
+                await synthesize_func(text, output_path, fixed_config)
+                return
+            except Exception as error:
+                cooldown = throttle_delay(error)
+                if cooldown is not None:
+                    EDGE_GATE.pause(cooldown)
+                    logging.warning("Edge 服务限流，暂停 Edge 请求约 %s 秒，保留待配音文本。", cooldown)
+                    raise EdgeRequestDeferred(cooldown, "Edge 返回 429，已暂停请求") from error
+                if isinstance(error, ValueError):
+                    raise
+                if attempt >= retry_count:
+                    if is_transient_voice_error(error):
+                        EDGE_GATE.pause(30)
+                    raise
+                delay = 5 * (2 ** attempt)
+                logging.warning("Edge 配音未完成，%s 秒后使用同一音色重试 (%s/%s)。", delay, attempt + 1, retry_count)
+                await sleeper(delay)
+    finally:
+        EDGE_GATE.release()
 
 
 async def synthesize(text, output_path, config):
@@ -1139,6 +1154,8 @@ def retry_delay_seconds(failures):
 def is_transient_voice_error(error):
     if isinstance(error, (VoiceBannedTermError, BannedRuleConfigError)):
         return False
+    if isinstance(error, EdgeRequestDeferred) or type(error).__name__ == "NoAudioReceived":
+        return True
     transient_type_names = {"TimeoutError", "ConnectionError", "gaierror"}
     if any(base.__name__ in transient_type_names for base in type(error).__mro__):
         return True
@@ -1151,6 +1168,7 @@ def is_transient_voice_error(error):
     return any(marker in text for marker in (
         "timed out", "timeout", "connection", "temporarily unavailable", "too many requests", "429",
         "network", "remote host", "websocket", "service unavailable", "503",
+        "no audio was received", "edge 未返回有效音频数据",
     ))
 
 
@@ -1172,6 +1190,9 @@ def process_once(
     failed_items_path = config.get("failed_items_path")
     for text_path in find_text_files(config):
         if stop_checker():
+            break
+        if config.get("engine") == "edge" and EDGE_GATE.remaining():
+            # Wait without claiming or moving any queued book during the cooldown.
             break
         key = str(text_path)
         claimed = None

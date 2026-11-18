@@ -4,6 +4,7 @@ import ctypes
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -88,7 +89,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.31"
+DEFAULT_APP_VERSION = "1.0.32-edge-test.1"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -344,6 +345,44 @@ def rebase_managed_paths(rewrite: dict, voice: dict) -> tuple[dict, dict]:
     return rewrite, voice
 
 
+def validate_edge_settings(rate: str, pitch: str, volume: str) -> dict[str, str]:
+    values = {"rate": rate.strip(), "pitch": pitch.strip(), "volume": volume.strip()}
+    for key, label, unit in (("rate", "语速", "%"), ("pitch", "语调", "Hz"), ("volume", "音量", "%")):
+        if re.fullmatch(r"[+-][0-9]+" + re.escape(unit), values[key]) is None:
+            raise ValueError(f"Edge {label}需要带正负号和单位，例如 +0{unit}。")
+    return values
+
+
+def test_edge_interface(voice_config: dict, edge_checker=None) -> str:
+    active_config = voice_monitor.default_config()
+    active_config.update(voice_config)
+    voice = voice_monitor.select_voice(active_config)
+    active_config.update({"voice": voice, "use_random_voice": False})
+    started = time.monotonic()
+    logging.info("开始 Edge 单独测试，音色：%s", voice)
+
+    async def check():
+        if edge_checker is not None:
+            await edge_checker(active_config)
+            return
+        with tempfile.TemporaryDirectory(prefix="novel-edge-test-") as temporary:
+            target = Path(temporary) / "edge-test.mp3"
+            await voice_monitor.edge_synthesize_with_retry("接口测试", target, active_config)
+
+    try:
+        asyncio.run(asyncio.wait_for(check(), timeout=120))
+        result = f"正常（{voice}，{time.monotonic() - started:.1f} 秒）"
+    except Exception as exc:
+        if isinstance(exc, TimeoutError):
+            reason = "测试超过 120 秒，请稍后再试。"
+        else:
+            reason = str(exc).splitlines()[0]
+            reason = re.sub(r"((?:https?|wss?)://[^\s\"'<>?]+)\?[^\s\"'<>]+", r"\1?[参数已隐藏]", reason)
+        result = f"失败：{reason}（{voice}，{type(exc).__name__}，{time.monotonic() - started:.1f} 秒）"
+    logging.info("Edge 单独测试结果：%s", result)
+    return result
+
+
 def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.post, wecom_sender=send_text_message, edge_checker=None, aliyun_checker=aliyun_tts.test_connection) -> dict[str, str]:
     results: dict[str, str] = {}
     api_key = (rewrite_root / "deepseek_api_key.txt").read_text(encoding="utf-8-sig").strip()
@@ -373,20 +412,8 @@ def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.pos
     except Exception as exc:
         results["企业微信"] = f"失败：{str(exc).splitlines()[0]}"
 
-    try:
-        if edge_checker is None:
-            async def edge_checker(active_config):
-                import edge_tts
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as file:
-                    target = Path(file.name)
-                try:
-                    await edge_tts.Communicate("接口测试", voice_monitor.select_voice(active_config), rate=active_config["rate"], volume=active_config["volume"], pitch=active_config["pitch"]).save(str(target))
-                finally:
-                    target.unlink(missing_ok=True)
-        asyncio.run(edge_checker(voice_config))
-        results["Edge"] = "正常"
-    except Exception as exc:
-        results["Edge"] = f"失败：{str(exc).splitlines()[0]}"
+    edge_result = test_edge_interface(voice_config, edge_checker=edge_checker)
+    results["Edge"] = "正常" if edge_result.startswith("正常") else edge_result
 
     try:
         if not voice_config.get("aliyun_appkey"):
@@ -635,6 +662,7 @@ class App(tk.Tk):
         self.progress = tk.StringVar(value="当前改写：无")
         self.source_dir = tk.StringVar(value=self.read_text(REWRITE_DIR / "检测.txt") or str(SOURCE_DIR))
         self._update_process = None
+        self._interface_test_active = False
         self._build()
         self.refresh_status()
         self.after(300, self.start)
@@ -646,6 +674,7 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="启动自动处理", command=self.start).pack(side="left")
         ttk.Button(toolbar, text="停止", command=self.stop).pack(side="left", padx=6)
         ttk.Button(toolbar, text="测试全部接口", command=self.start_interface_test).pack(side="left")
+        ttk.Button(toolbar, text="仅测试 Edge", command=self.start_edge_test).pack(side="left", padx=6)
         ttk.Button(toolbar, text="打开待改小说", command=lambda: self.open_folder(configured_source_dir(self.source_dir.get()))).pack(side="left")
         ttk.Button(toolbar, text="打开完成", command=lambda: self.open_folder(configured_output_dir(self.output_dir.get()))).pack(side="left", padx=6)
         ttk.Label(toolbar, textvariable=self.status).pack(side="right")
@@ -846,6 +875,13 @@ class App(tk.Tk):
         messagebox.showinfo("重新尝试配音", f"已移回配音队列：{len(moved)} 个文件。")
 
     def save_voice(self) -> bool:
+        edge_settings = {"rate": self.rate.get().strip(), "pitch": self.pitch.get().strip(), "volume": self.volume.get().strip()}
+        if self.engine.get() in {"edge", "edge_then_aliyun"}:
+            try:
+                edge_settings = validate_edge_settings(**edge_settings)
+            except ValueError as exc:
+                messagebox.showerror("无法保存", str(exc))
+                return False
         if self.random_voice.get() and not self.random_voices:
             messagebox.showerror("无法保存", "请先选择至少一个随机音色，或取消“随机选择 Edge 音色”。")
             return False
@@ -864,7 +900,7 @@ class App(tk.Tk):
         data = voice_monitor.load_config()
         data.update({
             "input_dir": str(REWRITTEN_DIR), "output_dir": self.output_dir.get().strip() or str(COMPLETE_DIR), "source_after_success": "move_to_output", "keep_text_after_voice": self.keep_text_after_voice.get(),
-            "engine": self.engine.get(), "voice": self.voice.get(), "rate": self.rate.get(), "pitch": self.pitch.get(), "volume": self.volume.get(),
+            "engine": self.engine.get(), "voice": self.voice.get(), **edge_settings,
             "use_random_voice": self.random_voice.get(), "random_voices": self.random_voices, "aliyun_appkey": self.aliyun_appkey.get().strip(),
             "aliyun_voice": self.aliyun_voice.get(), "aliyun_use_random_voice": self.aliyun_random_voice.get(), "aliyun_random_voices": self.aliyun_random_voices,
             "aliyun_rate": aliyun_rate, "aliyun_pitch": aliyun_pitch, "aliyun_volume": aliyun_volume,
@@ -958,18 +994,51 @@ class App(tk.Tk):
             messagebox.showerror("启动失败", str(exc))
 
     def start_interface_test(self) -> None:
+        if self._interface_test_active:
+            self.log("接口测试正在进行，请等待结果。")
+            return
         if not self.save_rewrite():
             return
         if not self.save_voice():
             return
         self.log("正在测试 AI、企业微信、Edge 和阿里云接口……")
+        self._interface_test_active = True
         threading.Thread(target=self._test_interfaces, daemon=True).start()
 
     def _test_interfaces(self) -> None:
-        results = test_interfaces(REWRITE_DIR, voice_monitor.load_config())
-        text = "\n".join(f"{name}：{result}" for name, result in results.items())
+        try:
+            results = test_interfaces(REWRITE_DIR, voice_monitor.load_config())
+            text = "\n".join(f"{name}：{result}" for name, result in results.items())
+        except Exception as exc:
+            text = f"接口测试失败：{type(exc).__name__}"
         self.log("接口测试完成。\n" + text)
-        self.after(0, lambda: messagebox.showinfo("接口测试结果", text))
+        self.after(0, lambda: self._finish_interface_test("接口测试结果", text))
+
+    def start_edge_test(self) -> None:
+        if self._interface_test_active:
+            self.log("接口测试正在进行，请等待结果。")
+            return
+        try:
+            edge_settings = validate_edge_settings(self.rate.get(), self.pitch.get(), self.volume.get())
+            if self.random_voice.get() and not self.random_voices:
+                raise ValueError("请先选择至少一个随机音色，或取消“随机选择 Edge 音色”。")
+        except ValueError as exc:
+            messagebox.showerror("无法测试 Edge", str(exc))
+            return
+        config = {"voice": self.voice.get(), "use_random_voice": self.random_voice.get(),
+                  "random_voices": list(self.random_voices), **edge_settings}
+        self._interface_test_active = True
+        self.log("正在单独测试 Edge 配音……")
+        threading.Thread(target=self._test_edge, args=(config,), daemon=True).start()
+
+    def _test_edge(self, config: dict) -> None:
+        text = test_edge_interface(config)
+        self.log("Edge 测试完成。\n" + text)
+        self.after(0, lambda: self._finish_interface_test("Edge 配音测试", text))
+
+    def _finish_interface_test(self, title: str, text: str) -> None:
+        self._interface_test_active = False
+        messagebox.showinfo(title, text)
 
     def stop(self) -> None:
         self.service.stop()

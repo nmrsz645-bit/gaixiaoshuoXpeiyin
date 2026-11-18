@@ -1,6 +1,6 @@
 # 项目维护约定
 
-1. 先读 README.md、HANDOFF.md、docs/releases/2026-10-31-github-verification.md，再核对 git status、分支、HEAD 和远端。当前本分支为 1.0.31；不要用旧 TIMEOFF 历史路径判断源码位置。
+1. 先读 README.md、HANDOFF.md、docs/EDGE-REPAIR-20261118.md，再核对 git status、分支、HEAD 和远端。当前本分支为 1.0.32-edge-test.1 测试候选，正式源码基线为 1.0.31。
 2. 权威源码是当前 Git checkout 根目录、novel_monitor/ 和 tools/。发布包、安装目录、业务目录、历史 build/验证副本均不是开发源。
 3. 保护用户配置、Key、Webhook、原文/备份、TXT/MP3、日志、队列/处理中、统计和回执；不清登录、不清锁、不重置真实任务、不覆盖未提交改动。同名文件等待，不能改名绕过保护。
 4. 新功能或修复先隔离复现和离线回归；有真实接口/任务/发送/恢复/发布副作用时，依据当前明确授权边界执行，不复用历史授权。GitHub 发布不授权 OSS/更新清单/下载站变更。
