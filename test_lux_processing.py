@@ -48,7 +48,7 @@ class LuxProcessingTests(unittest.TestCase):
                 self.assertTrue(all(path.exists() for path in paths))
                 self.assertNotIn(str(package), str(paths))
 
-    def test_portable_runtime_can_be_inside_app_when_sibling_is_incomplete(self):
+    def test_current_app_runtime_takes_precedence_over_older_sibling_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app = root / "test-app"
@@ -56,8 +56,8 @@ class LuxProcessingTests(unittest.TestCase):
             (root / "lux-runtime").mkdir()
             with patch.object(lux_tts.runtime, "BASE_DIR", app):
                 self.assertEqual(lux_tts.runtime_paths(""), expected)
-                sibling = self.make_runtime(root / "lux-runtime")
-                self.assertEqual(lux_tts.runtime_paths(""), sibling)
+                self.make_runtime(root / "lux-runtime")
+                self.assertEqual(lux_tts.runtime_paths(""), expected)
 
     def test_explicit_runtime_takes_precedence_and_legacy_app_layout_still_works(self):
         with tempfile.TemporaryDirectory() as temporary:

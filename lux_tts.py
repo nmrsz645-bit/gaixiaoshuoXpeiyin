@@ -55,7 +55,7 @@ def runtime_paths(directory=None):
     """Resolve portable assets on each use; an empty setting means bundled runtime."""
     base = Path(runtime.BASE_DIR).resolve()
     if directory is None or isinstance(directory, str) and not directory.strip():
-        for candidate in (base.parent / "lux-runtime", base / "lux-runtime"):
+        for candidate in (base / "lux-runtime", base.parent / "lux-runtime"):
             try:
                 return _runtime_paths_at(candidate.resolve(strict=True))
             except (OSError, ValueError):

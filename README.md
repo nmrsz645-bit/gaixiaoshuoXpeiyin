@@ -1,8 +1,8 @@
-# 小说处理中心 1.0.32-lux-test.2
+# 小说处理中心 1.0.32
 
-当前完整测试包已增加随包 LuxTTS 模型、CPU/GPU 运行环境与离线自检入口。解压后运行目录留空即可自动发现，无需安装或选择破甲。构建和迁移验证见 [完整测试包记录](docs/LUX-PORTABLE-20261118.md)。
+本版包含 Edge 修复、完整本地 LuxTTS、晓伊/晓晓默认随机、0.5～2 倍调速和私人声音克隆，并移除阿里云配音。模型、CPU/GPU 依赖随完整包及更新包分发，运行目录留空自动使用 `app/lux-runtime`，无需另装或选择破甲。见 [1.0.32 发布说明](docs/releases/2026-11-18-v1.0.32.md)。
 
-当前分支是 2026-11-18 的 LuxTTS 功能测试候选。支持 Edge、本地 LuxTTS，以及 Edge 失败后转本地 LuxTTS。两种服务默认均从晓伊、晓晓选一位，LuxTTS 支持 0.5～2 倍语速、私人声音克隆和试听。阿里云配音功能已移除。先读 [本次功能记录](docs/LUX-VOICE-20261118.md)，此前 Edge 修复见 [Edge 记录](docs/EDGE-REPAIR-20261118.md)。以下历史正式发布资料对应 1.0.31。
+提供 Edge、本地 LuxTTS，以及 Edge 失败后转本地 LuxTTS 三种模式。完整模型包约 5 GB；旧客户端首次升级的下载与临时解压约需额外 12.3 GB 空间，原安装和业务数据另计。测试候选的实际记录见 [Lux 功能](docs/LUX-VOICE-20261118.md)、[完整环境](docs/LUX-PORTABLE-20261118.md) 和 [Edge](docs/EDGE-REPAIR-20261118.md)。
 
 > 新 Windows 接手、环境、构建、版本、OSS/网站、验收回滚和凭据：**[完整发布指南](docs/RELEASE-GUIDE.md)**。
 
@@ -12,15 +12,15 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 
 ## 版本、源码和下载
 
-- 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.31) 含可运行 Windows 包、校验文件及说明文档。
+- 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.32) 提供完整 OSS 下载直链、校验文件与说明。大模型 ZIP 通过 OSS 分发。
 - 本公开仓库维护正式版源码；测试版单独维护，不能误标为稳定版或擅自公开测试源码。
-- 正式版为 **1.0.31**。本版包含同名跳过、超过 24 小时的同名成品回收和自动流程页提示。GitHub Release 与 OSS 客户端更新分别验证。
-- 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [1.0.31 变更说明](docs/releases/2026-11-10-v1.0.31.md)。
-- 当前测试分支根 `version.json` 和源码显示回退值均为 **1.0.32-lux-test.2**。测试构建显式传 `--version 1.0.32-lux-test.2`，带测试后缀的版本跳过更新器安装与检查。以下正式版流程示例仍使用 1.0.31，原 Windows 包和标签保持不变。
+- 正式版为 **1.0.32**，保留 1.0.31 的同名跳过、24 小时同名成品回收和自动流程页提示。旧版说明见 [1.0.31](docs/releases/2026-11-10-v1.0.31.md)。
+- 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md) 和本次发布记录。源码、包、上传、网站和真实客户端验收分别报告。
+- 根 `version.json`、源码回退值及正式构建参数一致为 **1.0.32**。`build_github_release.py` 仅构建应用基础包，必须再经 `build_lux_release.py` 组合模型才能正式分发。带 `-` 后缀的测试版继续跳过更新器。
 
 ## GitHub Latest 兼容约束
 
-最新正式程序为 1.0.31，使用上方版本专属 Release 链接下载。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
+最新正式程序为 1.0.32，使用上方版本专属 Release 链接下载。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
 
 ## Windows 安装与启动
 

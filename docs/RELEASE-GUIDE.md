@@ -1,5 +1,7 @@
 # 新 Windows 接手、构建与发布指南（1.0.31）
 
+> 当前版本已到 1.0.32。先读 [本次发布说明](releases/2026-11-18-v1.0.32.md) 和 HANDOFF 的实际发布结果。下文保留 1.0.31 的历史通道与凭据操作资料；新的 `build_github_release.py` 只产出应用基础包，必须经 `build_lux_release.py` 加入模型后才可分发。阿里云配音已移除，Edge 依赖为 7.3.1，不能照旧文安装 NLS 或发布无模型基础包。
+
 更新：2026-10-31。适用：`nmrsz645-bit/gaixiaoshuoXpeiyin` / `main`，公开正式源码。本次只补文档，未改程序/版本/包/标签/Release/OSS/网站，也未操作另一台电脑。
 
 先读 [README](../README.md)、[HANDOFF](../HANDOFF.md)、[AGENTS](../AGENTS.md)。本指南依次覆盖源码环境、数据迁移、版本与组包、真实更新机制、OSS、网站/catalog、验收回滚和凭据；命令按用途分段，不是可整份粘贴运行的脚本。生产上传、网站发布、真实任务恢复仍需各自明确授权。
