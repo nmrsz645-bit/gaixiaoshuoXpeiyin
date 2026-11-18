@@ -29,7 +29,7 @@ from novel_monitor.history import append_history, prune_history
 from novel_monitor.file_utils import title_claim_guard, same_title
 from novel_monitor.logging_setup import cleanup_old_logs
 from novel_monitor.runner import is_transient_error
-from unified_app import ALIYUN_VOICES, BAILIAN_AI_SERVICE, BAILIAN_MODEL_CHOICES, COMPLETE_DIR, DEFAULT_APP_VERSION, OFFICIAL_AI_SERVICE, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, ai_service_for_url, app_window_title, configured_output_dir, configured_source_dir, normalize_aliyun_random_voices, normalize_random_voices, read_app_version, rebase_managed_paths, test_interfaces
+from unified_app import BAILIAN_AI_SERVICE, BAILIAN_MODEL_CHOICES, COMPLETE_DIR, DEFAULT_APP_VERSION, OFFICIAL_AI_SERVICE, REWRITTEN_DIR, REWRITE_DIR, REWRITE_FAILED_DIR, SOURCE_DIR, DailyStats, UnifiedService, ai_service_for_url, app_window_title, configured_output_dir, configured_source_dir, normalize_random_voices, read_app_version, rebase_managed_paths, test_interfaces
 
 
 class PipelineTests(unittest.TestCase):
@@ -2881,17 +2881,18 @@ class PipelineTests(unittest.TestCase):
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
             version_file.write_text("not-json", encoding="utf-8")
-            self.assertEqual(read_app_version((version_file,)), "1.0.32-edge-test.1")
+            self.assertEqual(read_app_version((version_file,)), "1.0.32-lux-test.1")
             version_file.unlink()
-            self.assertEqual(read_app_version((version_file,)), "1.0.32-edge-test.1")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.32-edge-test.1")
-        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.32-edge-test.1")
-        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.32-edge-test.1")
+            self.assertEqual(read_app_version((version_file,)), "1.0.32-lux-test.1")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.32-lux-test.1")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.32-lux-test.1")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.32-lux-test.1")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
-    def test_aliyun_random_voice_selection_uses_only_known_voices(self):
-        selected = normalize_aliyun_random_voices([ALIYUN_VOICES[2], "not-a-voice", ALIYUN_VOICES[0]])
-        self.assertEqual(selected, [ALIYUN_VOICES[0], ALIYUN_VOICES[2]])
+    def test_lux_random_voice_defaults_use_only_two_builtin_references(self):
+        config = voice_monitor.default_config()
+        self.assertEqual(set(config["lux_random_voices"]), {"zh-CN-XiaoyiNeural", "zh-CN-XiaoxiaoNeural"})
+        self.assertEqual(voice_monitor.select_lux_voice(config, chooser=lambda voices: voices[0]), "zh-CN-XiaoyiNeural")
 
     def test_rebases_copied_release_paths_to_current_program(self):
         rewrite, voice = rebase_managed_paths({"outputDir": "D:/old/app/已改完成"}, {"input_dir": "D:/another-old/app/已改完成"})
@@ -2929,9 +2930,9 @@ class PipelineTests(unittest.TestCase):
                 return Response()
 
             (root / "ai_api_url.txt").write_text("https://workspace.cn-beijing.maas.aliyuncs.com/api/v1", encoding="utf-8")
-            results = test_interfaces(root, {"aliyun_appkey": ""}, ai_post=ai_post, edge_checker=edge_check)
+            results = test_interfaces(root, {"engine": "edge"}, ai_post=ai_post, edge_checker=edge_check)
 
-            self.assertEqual(results, {"AI": "正常", "企业微信": "未配置", "Edge": "正常", "阿里云": "未配置"})
+            self.assertEqual(results, {"AI": "正常", "企业微信": "未配置", "Edge": "正常", "LuxTTS": "未启用"})
             self.assertEqual(request_urls, ["https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"])
             self.assertFalse(request_bodies[0]["enable_thinking"])
 
@@ -2991,23 +2992,23 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(request_bodies[0]["enable_thinking"])
         self.assertNotIn("thinking", request_bodies[0])
 
-    def test_edge_failure_falls_back_to_aliyun_and_produces_valid_mp3(self):
+    def test_edge_failure_falls_back_to_lux_and_produces_valid_mp3(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "voice.mp3"
             config = voice_monitor.default_config()
-            config.update({"engine": "edge_then_aliyun", "aliyun_appkey": "fake"})
+            config.update({"engine": "edge_then_lux"})
 
             async def edge_failure(*_args, **_kwargs):
                 raise RuntimeError("Edge unavailable")
 
-            def aliyun_success(_text, output_path, _config, progress):
+            def lux_success(_text, output_path, _config):
                 Path(output_path).write_bytes(self.valid_mp3_bytes())
 
-            with patch.object(voice_monitor, "edge_synthesize_with_retry", side_effect=edge_failure), patch.object(voice_monitor.aliyun_tts, "synthesize", side_effect=aliyun_success) as aliyun:
+            with patch.object(voice_monitor, "edge_synthesize_with_retry", side_effect=edge_failure), patch("lux_tts.synthesize", side_effect=lux_success) as local:
                 engine = asyncio.run(voice_monitor.synthesize("正文", output, config))
-            self.assertEqual(engine, "aliyun")
+            self.assertEqual(engine, "lux_tts")
             self.assertTrue(voice_monitor._valid_mp3(output))
-            self.assertEqual(aliyun.call_count, 1)
+            self.assertEqual(local.call_count, 1)
 
     def test_long_mp3_is_trimmed_to_35_minutes_atomically(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5729,6 +5730,7 @@ class PipelineTests(unittest.TestCase):
             app = root / "app"
             patch_dir = root / "resources" / "updater-patch"
             app.mkdir()
+            (app / "version.json").write_text('{"version":"1.0.31"}', encoding="utf-8")
             patch_dir.mkdir(parents=True)
             (patch_dir / "UpdateAgent.exe").write_bytes(b"new updater")
             (patch_dir / "updater-config.json").write_text('{"appId":"test"}', encoding="utf-8")
@@ -5755,6 +5757,23 @@ class PipelineTests(unittest.TestCase):
             result = unified_app.launch_update_check(Path(temporary) / "candidate", Path(temporary), runner)
             self.assertIsNone(result)
             runner.assert_not_called()
+
+    def test_runtime_update_does_not_install_or_run_agent_for_test_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            patch_dir = root / "resources" / "updater-patch"
+            app.mkdir()
+            patch_dir.mkdir(parents=True)
+            (app / "version.json").write_text('{"version":"1.0.32-lux-test.1"}', encoding="utf-8")
+            (patch_dir / "UpdateAgent.exe").write_bytes(b"must not install")
+            (patch_dir / "updater-config.json").write_text('{}', encoding="utf-8")
+            runner = Mock()
+
+            self.assertIsNone(unified_app.launch_update_check(app, root / "resources", runner))
+
+            runner.assert_not_called()
+            self.assertFalse((root / "updater").exists())
 
     def test_bundled_updater_reads_the_domestic_oss_manifest(self):
         config_path = Path(__file__).resolve().parent / "updater-patch" / "updater-config.json"

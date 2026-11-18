@@ -15,7 +15,6 @@ from datetime import datetime
 from pathlib import Path
 
 import runtime
-import aliyun_tts
 from edge_request_policy import EDGE_GATE, EdgeRequestDeferred, throttle_delay
 from novel_monitor.logging_setup import retained_file_handler
 from novel_monitor.file_utils import internal_queue_original_name, move_to_directory, recycle_expired_completed_file, same_title
@@ -109,14 +108,12 @@ def default_config():
         "keep_text_after_voice": True,
         "delete_source": True,
         "extensions": [".txt"],
-        "aliyun_appkey": "",
-        "aliyun_voice": aliyun_tts.DEFAULT_VOICE,
-        "aliyun_use_random_voice": False,
-        "aliyun_random_voices": [],
-        "aliyun_rate": 0,
-        "aliyun_pitch": 0,
-        "aliyun_volume": 50,
-        "aliyun_chunk_chars": 450,
+        "lux_runtime_dir": "",
+        "lux_speed": 1.0,
+        "lux_backend": "auto",
+        "lux_voice": "zh-CN-XiaoxiaoNeural",
+        "lux_use_random_voice": True,
+        "lux_random_voices": ["zh-CN-XiaoyiNeural", "zh-CN-XiaoxiaoNeural"],
     }
 
 
@@ -126,6 +123,8 @@ def load_config(path=CONFIG_PATH):
         config.update(json.loads(path.read_text(encoding="utf-8-sig")))
     else:
         save_config(config, path)
+    if config.get("engine") in {"aliyun", "edge_then_aliyun"}:
+        config["engine"] = "edge"
     # The rewrite monitor and the voice worker must inspect the same directory.
     # Relative voice paths are anchored to the application config, not the process cwd.
     for key in ("input_dir", "output_dir"):
@@ -794,11 +793,27 @@ def select_voice(config, chooser=random.choice):
     return config["voice"]
 
 
-def select_aliyun_voice(config, chooser=random.choice):
-    voices = config.get("aliyun_random_voices") or []
-    if config.get("aliyun_use_random_voice") and voices:
+def select_lux_voice(config, chooser=random.choice):
+    voices = config.get("lux_random_voices") or []
+    if config.get("lux_use_random_voice", True) and voices:
         return chooser(voices)
-    return config.get("aliyun_voice", aliyun_tts.DEFAULT_VOICE)
+    return config.get("lux_voice", "zh-CN-XiaoxiaoNeural")
+
+
+def validate_voice_config(config):
+    engine = config.get("engine", "edge")
+    if engine not in {"edge", "lux_tts", "edge_then_lux"}:
+        raise ValueError("请选择 Edge、本地 LuxTTS 或 Edge 失败后本地 LuxTTS。")
+    if engine == "edge":
+        return
+    import lux_tts
+    from lux_voice_store import resolve_profile
+
+    lux_tts.validate_speed(config.get("lux_speed", 1.0))
+    lux_tts.runtime_paths(config.get("lux_runtime_dir"))
+    voices = config.get("lux_random_voices") if config.get("lux_use_random_voice", True) else None
+    for voice in voices or [config.get("lux_voice", "zh-CN-XiaoxiaoNeural")]:
+        resolve_profile(config, voice)
 
 
 def voices_from_number_files(config):
@@ -887,30 +902,37 @@ async def edge_synthesize_with_retry(text, output_path, config, synthesize_func=
 
 
 async def synthesize(text, output_path, config):
-    async def use_aliyun():
-        filename = Path(output_path).stem
-        aliyun_config = dict(config)
-        aliyun_config["aliyun_voice"] = select_aliyun_voice(config)
-        logging.info("Using Aliyun voice: %s", aliyun_config["aliyun_voice"])
-        await asyncio.to_thread(
-            aliyun_tts.synthesize,
-            text,
-            output_path,
-            aliyun_config,
-            lambda index, total: write_current_task(f"阿里云配音 {filename}：第 {index}/{total} 段"),
-        )
+    async def use_lux():
+        import lux_tts
+        from lux_voice_store import resolve_profile
 
-    if config.get("engine") == "aliyun":
-        await use_aliyun()
-        return "aliyun"
-    if config.get("engine") == "edge_then_aliyun":
+        voice = select_lux_voice(config)
+        profile = resolve_profile(config, voice)
+        local_config = dict(config, voice=voice, use_random_voice=False,
+                            lux_reference_path=str(profile["reference"]),
+                            lux_reference_sha256=profile["sha256"])
+        logging.info("本地 LuxTTS 配音，音色：%s，语速：%s", profile["name"], config.get("lux_speed", 1.0))
+        await asyncio.to_thread(lux_tts.synthesize, text, output_path, local_config)
+
+    engine = config.get("engine", "edge")
+    if engine == "lux_tts":
+        await use_lux()
+        return "lux_tts"
+    if engine == "edge_then_lux":
         try:
             await edge_synthesize_with_retry(text, output_path, config)
             return "edge"
         except Exception as exc:
-            logging.warning("Edge 配音失败，自动切换阿里云：%s", exc)
-            await use_aliyun()
-            return "aliyun"
+            if isinstance(exc, ValueError):
+                raise
+            logging.warning("Edge 配音暂时失败，切换本地 LuxTTS。错误类型：%s", type(exc).__name__)
+            try:
+                await use_lux()
+                return "lux_tts"
+            except Exception as local_error:
+                raise RuntimeError("Edge 与本地 LuxTTS 暂时未完成，已保留文本等待重试。") from local_error
+    if engine != "edge":
+        raise ValueError("请选择 Edge、本地 LuxTTS 或 Edge 失败后本地 LuxTTS。")
     await edge_synthesize_with_retry(text, output_path, config)
     return "edge"
 
@@ -1109,7 +1131,8 @@ def process_file(text_path, config, synthesize=synthesize, on_success=None):
         elif not config.get("keep_text_after_voice", True) or config.get("delete_source", True):
             text_path.unlink()
     receipt_path.unlink(missing_ok=True)
-    logging.info("已生成: [%s] %s", "Edge" if actual_engine == "edge" else "阿里云", output_path)
+    engine_label = {"edge": "Edge", "lux_tts": "本地 LuxTTS"}.get(actual_engine, "历史配音")
+    logging.info("已生成: [%s] %s", engine_label, output_path)
     if on_success:
         try:
             on_success(actual_engine)
@@ -1152,6 +1175,18 @@ def retry_delay_seconds(failures):
 
 
 def is_transient_voice_error(error):
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if _is_direct_transient_voice_error(error):
+            return True
+        if isinstance(error, (VoiceBannedTermError, BannedRuleConfigError)):
+            return False
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    return False
+
+
+def _is_direct_transient_voice_error(error):
     if isinstance(error, (VoiceBannedTermError, BannedRuleConfigError)):
         return False
     if isinstance(error, EdgeRequestDeferred) or type(error).__name__ == "NoAudioReceived":
@@ -1169,6 +1204,7 @@ def is_transient_voice_error(error):
         "timed out", "timeout", "connection", "temporarily unavailable", "too many requests", "429",
         "network", "remote host", "websocket", "service unavailable", "503",
         "no audio was received", "edge 未返回有效音频数据",
+        "edge 与本地 luxtts 暂时未完成",
     ))
 
 

@@ -3,12 +3,14 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import math
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import asyncio
 import tempfile
 from contextlib import nullcontext
@@ -20,9 +22,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import voice_monitor
-import aliyun_tts
 import requests
-from credential_store import protect, unprotect
 from novel_monitor.config import DEFAULT_AI_URL, _chat_completions_url, ensure_directories, load_config
 from novel_monitor.deepseek_client import (
     BANNED_TERMS_FILE_NAME,
@@ -48,14 +48,6 @@ REWRITE_FAILED_DIR = BASE_DIR / "改写失败"
 COMPLETE_DIR = BASE_DIR / "完成"
 VOICE_FAILED_DIR = BASE_DIR / "配音失败"
 DAILY_STATS_PATH = BASE_DIR / "每日统计.json"
-ALIYUN_VOICES = (
-    "xiaoyun",
-    "longsanshu", "longxiu_v2", "longmiao_v2", "longyue_v2", "longnan_v2", "longyuan_v2",
-    "longbaizhi", "longdaiyu", "longgaoseng", "longxiaocheng_v2", "longhan_v2", "longhao_v2",
-    "longtian_v2", "longze_v2", "longzhe_v2", "longxing_v2", "longyan_v2", "longqiang_v2",
-    "longfeifei_v2", "longanrou", "longcheng_v2", "longshu_v2", "loongbella_v2", "longwan_v2",
-    "longxiaochun_v2", "longxiaoxia_v2", "longhua_v2", "longhuhu", "longanpei", "longyingmu",
-)
 EDGE_VOICE_NAMES = {
     "zh-CN-XiaoxiaoNeural": "晓晓（女声）", "zh-CN-XiaoyiNeural": "晓伊（女声）",
     "zh-CN-YunjianNeural": "云健（男声）", "zh-CN-YunxiNeural": "云希（男声）",
@@ -64,16 +56,6 @@ EDGE_VOICE_NAMES = {
     "zh-HK-HiuGaaiNeural": "晓佳（粤语女声）", "zh-HK-HiuMaanNeural": "晓曼（粤语女声）",
     "zh-HK-WanLungNeural": "云龙（粤语男声）", "zh-TW-HsiaoChenNeural": "晓臻（台湾女声）",
     "zh-TW-HsiaoYuNeural": "晓雨（台湾女声）", "zh-TW-YunJheNeural": "云哲（台湾男声）",
-}
-ALIYUN_VOICE_NAMES = {
-    "xiaoyun": "小云（xiaoyun）", "longsanshu": "龙三叔（longsanshu）", "longxiu_v2": "龙修（longxiu_v2）", "longmiao_v2": "龙妙（longmiao_v2）",
-    "longyue_v2": "龙悦（longyue_v2）", "longnan_v2": "龙楠（longnan_v2）", "longyuan_v2": "龙媛（longyuan_v2）", "longbaizhi": "龙白芷（longbaizhi）",
-    "longdaiyu": "龙黛玉（longdaiyu）", "longgaoseng": "龙高僧（longgaoseng）", "longxiaocheng_v2": "龙小诚（longxiaocheng_v2）", "longhan_v2": "龙寒（longhan_v2）",
-    "longhao_v2": "龙浩（longhao_v2）", "longtian_v2": "龙天（longtian_v2）", "longze_v2": "龙泽（longze_v2）", "longzhe_v2": "龙哲（longzhe_v2）",
-    "longxing_v2": "龙星（longxing_v2）", "longyan_v2": "龙颜（longyan_v2）", "longqiang_v2": "龙嫱（longqiang_v2）", "longfeifei_v2": "龙菲菲（longfeifei_v2）",
-    "longanrou": "龙安柔（longanrou）", "longcheng_v2": "龙橙（longcheng_v2）", "longshu_v2": "龙书（longshu_v2）", "loongbella_v2": "Bella2.0（loongbella_v2）",
-    "longwan_v2": "龙婉（longwan_v2）", "longxiaochun_v2": "龙小淳（longxiaochun_v2）", "longxiaoxia_v2": "龙小夏（longxiaoxia_v2）", "longhua_v2": "龙华（longhua_v2）",
-    "longhuhu": "龙呼呼（标杆音色，longhuhu）", "longanpei": "龙安培（longanpei）", "longyingmu": "龙应沐（longyingmu）",
 }
 
 
@@ -89,7 +71,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.32-edge-test.1"
+DEFAULT_APP_VERSION = "1.0.32-lux-test.1"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -166,6 +148,8 @@ def launch_update_check(
     runner=subprocess.Popen,
 ):
     if app_dir.name.lower() != "app":
+        return None
+    if "-" in read_app_version((app_dir / APP_VERSION_FILE_NAME,)):
         return None
     patch_dir = resource_dir / "updater-patch"
     updater_dir = app_dir.parent / "updater"
@@ -248,11 +232,6 @@ def normalize_random_voices(selected: list[str]) -> list[str]:
     return [voice for voice in voice_monitor.ALL_CHINESE_VOICES if voice in selected_set]
 
 
-def normalize_aliyun_random_voices(selected: list[str]) -> list[str]:
-    selected_set = set(selected)
-    return [voice for voice in ALIYUN_VOICES if voice in selected_set]
-
-
 def configured_source_dir(value: str) -> Path:
     return Path(value.strip()) if value.strip() else SOURCE_DIR
 
@@ -262,7 +241,7 @@ def configured_output_dir(value: str) -> Path:
 
 
 class DailyStats:
-    KEYS = ("rewrite_success", "rewrite_failed", "voice_success", "voice_failed", "edge_success", "aliyun_success")
+    KEYS = ("rewrite_success", "rewrite_failed", "voice_success", "voice_failed", "edge_success", "lux_success")
 
     def __init__(self, path: Path = DAILY_STATS_PATH) -> None:
         self.path = path
@@ -286,6 +265,10 @@ class DailyStats:
                 data = {}
             if data.get("date") != today:
                 data = {"date": today, **{key: 0 for key in self.KEYS}, "events": {}}
+                self._write(data)
+            elif any(key not in data for key in self.KEYS):
+                for key in self.KEYS:
+                    data.setdefault(key, 0)
                 self._write(data)
             return data
 
@@ -383,7 +366,43 @@ def test_edge_interface(voice_config: dict, edge_checker=None) -> str:
     return result
 
 
-def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.post, wecom_sender=send_text_message, edge_checker=None, aliyun_checker=aliyun_tts.test_connection) -> dict[str, str]:
+def validate_lux_settings(runtime_dir: str, speed: str) -> dict:
+    try:
+        multiplier = float(speed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("LuxTTS 语速需要是 0.5 到 2.0 的倍数，例如 1.0。") from exc
+    if not math.isfinite(multiplier) or not 0.5 <= multiplier <= 2.0:
+        raise ValueError("LuxTTS 语速需要在 0.5 到 2.0 之间，1.0 为正常速度。")
+    return {"lux_runtime_dir": runtime_dir.strip(), "lux_speed": multiplier}
+
+
+def test_lux_interface(voice_config: dict, lux_checker=None, preview_path: Path | None = None) -> str:
+    active_config = voice_monitor.default_config()
+    active_config.update(voice_config)
+    active_config["engine"] = "lux_tts"
+    started = time.monotonic()
+
+    async def check():
+        if preview_path is not None and (preview_path.exists() or preview_path.is_symlink()):
+            raise FileExistsError("试听文件已存在，请重新开始试听以使用新文件名。")
+        if lux_checker is not None:
+            await lux_checker(active_config)
+            return
+        if preview_path is not None:
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            await voice_monitor.synthesize("你好，这是本地配音试听。", preview_path, active_config)
+            return
+        with tempfile.TemporaryDirectory(prefix="novel-lux-test-") as temporary:
+            await voice_monitor.synthesize("你好，这是本地配音试听。", Path(temporary) / "lux-test.mp3", active_config)
+
+    try:
+        asyncio.run(check())
+        return f"正常（LuxTTS，{time.monotonic() - started:.1f} 秒）"
+    except Exception as exc:
+        return f"失败：{str(exc).splitlines()[0]}（{type(exc).__name__}，{time.monotonic() - started:.1f} 秒）"
+
+
+def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.post, wecom_sender=send_text_message, edge_checker=None, lux_checker=None) -> dict[str, str]:
     results: dict[str, str] = {}
     api_key = (rewrite_root / "deepseek_api_key.txt").read_text(encoding="utf-8-sig").strip()
     api_url = _chat_completions_url((rewrite_root / "ai_api_url.txt").read_text(encoding="utf-8-sig").strip())
@@ -415,17 +434,11 @@ def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.pos
     edge_result = test_edge_interface(voice_config, edge_checker=edge_checker)
     results["Edge"] = "正常" if edge_result.startswith("正常") else edge_result
 
-    try:
-        if not voice_config.get("aliyun_appkey"):
-            results["阿里云"] = "未配置"
-        else:
-            aliyun_checker(voice_config)
-            results["阿里云"] = "正常"
-    except Exception as exc:
-        if "SignatureDoesNotMatch" in str(exc):
-            results["阿里云"] = "签名不匹配：请确认 AccessKey ID 与 AccessKey Secret 是同一对。"
-        else:
-            results["阿里云"] = f"失败：{str(exc).splitlines()[0]}"
+    if voice_config.get("engine") in {"lux_tts", "edge_then_lux"}:
+        lux_result = test_lux_interface(voice_config, lux_checker=lux_checker)
+        results["LuxTTS"] = "正常" if lux_result.startswith("正常") else lux_result
+    else:
+        results["LuxTTS"] = "未启用"
     return results
 
 
@@ -554,8 +567,10 @@ class UnifiedService:
             self.stop_event.clear()
             self.worker_recovery_after = {"rewrite": 0.0, "voice": 0.0}
             try:
+                voice_config = voice_monitor.load_config()
+                voice_monitor.validate_voice_config(voice_config)
                 # 先把崩溃时已领取但尚未完成的配音 TXT 放回队列，再恢复改写任务。
-                voice_monitor.recover_claimed_files(voice_monitor.load_config())
+                voice_monitor.recover_claimed_files(voice_config)
                 self._start_rewrite_worker()
                 self._start_voice_worker()
             except Exception:
@@ -622,7 +637,10 @@ class UnifiedService:
 
     def _on_voice_success(self, engine: str) -> None:
         self.daily_stats.add("voice_success")
-        self.daily_stats.add("edge_success" if engine == "edge" else "aliyun_success")
+        if engine == "edge":
+            self.daily_stats.add("edge_success")
+        elif engine == "lux_tts":
+            self.daily_stats.add("lux_success")
 
     def _on_voice_failure(self) -> None:
         self.daily_stats.add("voice_failed")
@@ -675,6 +693,7 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="停止", command=self.stop).pack(side="left", padx=6)
         ttk.Button(toolbar, text="测试全部接口", command=self.start_interface_test).pack(side="left")
         ttk.Button(toolbar, text="仅测试 Edge", command=self.start_edge_test).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="试听 LuxTTS", command=self.start_lux_test).pack(side="left")
         ttk.Button(toolbar, text="打开待改小说", command=lambda: self.open_folder(configured_source_dir(self.source_dir.get()))).pack(side="left")
         ttk.Button(toolbar, text="打开完成", command=lambda: self.open_folder(configured_output_dir(self.output_dir.get()))).pack(side="left", padx=6)
         ttk.Label(toolbar, textvariable=self.status).pack(side="right")
@@ -756,69 +775,63 @@ class App(tk.Tk):
         page = ttk.Frame(tabs, padding=16)
         tabs.add(page, text="配音设置")
         data = voice_monitor.load_config()
-        self.engine = tk.StringVar(value=data.get("engine", "edge_then_aliyun"))
+        self.engine = tk.StringVar(value=data.get("engine", "edge"))
         self.voice = tk.StringVar(value=data.get("voice", voice_monitor.ALL_CHINESE_VOICES[0]))
         self.voice_name = tk.StringVar(value=voice_display(self.voice.get(), EDGE_VOICE_NAMES))
         self.rate = tk.StringVar(value=data.get("rate", "+0%"))
         self.pitch = tk.StringVar(value=data.get("pitch", "+0Hz"))
         self.volume = tk.StringVar(value=data.get("volume", "+0%"))
+        self.lux_runtime_dir = tk.StringVar(value=data.get("lux_runtime_dir", ""))
+        self.lux_speed = tk.StringVar(value=str(data.get("lux_speed", 1.0)))
         self.output_dir = tk.StringVar(value=data.get("output_dir", str(COMPLETE_DIR)))
         self.keep_text_after_voice = tk.BooleanVar(value=bool(data.get("keep_text_after_voice", True)))
         self.random_voice = tk.BooleanVar(value=bool(data.get("use_random_voice", False)))
         self.random_voices = normalize_random_voices(data.get("random_voices", []))
         self.random_voice_summary = tk.StringVar()
         self.update_random_voice_summary()
-        self.aliyun_appkey = tk.StringVar(value=data.get("aliyun_appkey", ""))
-        self.aliyun_voice = tk.StringVar(value=data.get("aliyun_voice", aliyun_tts.DEFAULT_VOICE))
-        self.aliyun_voice_name = tk.StringVar(value=voice_display(self.aliyun_voice.get(), ALIYUN_VOICE_NAMES))
-        self.aliyun_rate = tk.StringVar(value=str(data.get("aliyun_rate", 0)))
-        self.aliyun_pitch = tk.StringVar(value=str(data.get("aliyun_pitch", 0)))
-        self.aliyun_volume = tk.StringVar(value=str(data.get("aliyun_volume", 50)))
-        self.aliyun_random_voice = tk.BooleanVar(value=bool(data.get("aliyun_use_random_voice", False)))
-        self.aliyun_random_voices = normalize_aliyun_random_voices(data.get("aliyun_random_voices", []))
-        self.aliyun_random_voice_summary = tk.StringVar()
-        self.update_aliyun_random_voice_summary()
-        self.aliyun_id = tk.StringVar(value=unprotect(data.get("aliyun_access_key_id_protected", "")))
-        self.aliyun_secret = tk.StringVar(value=unprotect(data.get("aliyun_access_key_secret_protected", "")))
         rows = (
-            ("引擎", "engine"), ("Edge 音色", "voice"), ("语速", "rate"), ("语调", "pitch"), ("音量", "volume"),
-            ("阿里云音色", "aliyun_voice"), ("阿里云语速（-500~500）", "aliyun_rate"), ("阿里云语调（-500~500）", "aliyun_pitch"), ("阿里云音量（0~100）", "aliyun_volume"),
-            ("阿里云 AppKey", "appkey"), ("阿里云 AccessKey ID", "id"), ("阿里云 AccessKey Secret", "secret"),
+            ("引擎", "engine"), ("Edge 音色", "voice"), ("Edge 语速", "rate"), ("Edge 语调", "pitch"), ("Edge 音量", "volume"),
+            ("LuxTTS 运行目录", "lux_runtime_dir"), ("LuxTTS 语速（0.5～2.0 倍）", "lux_speed"),
         )
-        variables = {"engine": self.engine, "voice": self.voice_name, "rate": self.rate, "pitch": self.pitch, "volume": self.volume, "aliyun_voice": self.aliyun_voice_name, "aliyun_rate": self.aliyun_rate, "aliyun_pitch": self.aliyun_pitch, "aliyun_volume": self.aliyun_volume, "appkey": self.aliyun_appkey, "id": self.aliyun_id, "secret": self.aliyun_secret}
+        variables = {"engine": self.engine, "voice": self.voice_name, "rate": self.rate, "pitch": self.pitch,
+                     "volume": self.volume, "lux_runtime_dir": self.lux_runtime_dir, "lux_speed": self.lux_speed}
         for row, (label, name) in enumerate(rows):
             ttk.Label(page, text=label).grid(row=row, column=0, sticky="w", pady=5)
             if name == "engine":
-                ttk.Combobox(page, textvariable=variables[name], values=("edge", "edge_then_aliyun", "aliyun"), state="readonly", width=30).grid(row=row, column=1, sticky="w", pady=5)
+                ttk.Combobox(page, textvariable=variables[name], values=("edge", "edge_then_lux", "lux_tts"), state="readonly", width=30).grid(row=row, column=1, sticky="w", pady=5)
             elif name == "voice":
                 box = ttk.Combobox(page, textvariable=variables[name], values=[voice_display(code, EDGE_VOICE_NAMES) for code in voice_monitor.ALL_CHINESE_VOICES], width=40, state="readonly")
                 box.grid(row=row, column=1, sticky="w", pady=5)
                 box.bind("<<ComboboxSelected>>", lambda _event: self.voice.set(voice_code(self.voice_name.get(), EDGE_VOICE_NAMES)))
-            elif name == "aliyun_voice":
-                box = ttk.Combobox(page, textvariable=variables[name], values=[voice_display(code, ALIYUN_VOICE_NAMES) for code in ALIYUN_VOICES], width=40, state="readonly")
-                box.grid(row=row, column=1, sticky="w", pady=5)
-                box.bind("<<ComboboxSelected>>", lambda _event: self.aliyun_voice.set(voice_code(self.aliyun_voice_name.get(), ALIYUN_VOICE_NAMES)))
             else:
-                ttk.Entry(page, textvariable=variables[name], width=58, show="*" if name == "secret" else "").grid(row=row, column=1, sticky="ew", pady=5)
+                ttk.Entry(page, textvariable=variables[name], width=58).grid(row=row, column=1, sticky="ew", pady=5)
+            if name == "lux_runtime_dir":
+                ttk.Button(page, text="选择文件夹", command=self.choose_lux_runtime_dir).grid(row=row, column=2, padx=(6, 0), pady=5)
         random_row = ttk.Frame(page)
-        random_row.grid(row=12, column=1, sticky="w", pady=5)
+        random_row.grid(row=7, column=1, sticky="w", pady=5)
         ttk.Checkbutton(random_row, text="随机选择 Edge 音色", variable=self.random_voice).pack(side="left")
         ttk.Button(random_row, text="选择随机音色", command=self.choose_random_voices).pack(side="left", padx=8)
         ttk.Label(random_row, textvariable=self.random_voice_summary).pack(side="left")
-        aliyun_random_row = ttk.Frame(page)
-        aliyun_random_row.grid(row=13, column=1, sticky="w", pady=5)
-        ttk.Checkbutton(aliyun_random_row, text="随机选择阿里云音色", variable=self.aliyun_random_voice).pack(side="left")
-        ttk.Button(aliyun_random_row, text="选择阿里云随机音色", command=self.choose_aliyun_random_voices).pack(side="left", padx=8)
-        ttk.Label(aliyun_random_row, textvariable=self.aliyun_random_voice_summary).pack(side="left")
-        ttk.Label(page, text="配音完成输出目录").grid(row=14, column=0, sticky="w", pady=5)
-        ttk.Entry(page, textvariable=self.output_dir, width=58).grid(row=14, column=1, sticky="ew", pady=5)
-        ttk.Button(page, text="选择文件夹", command=self.choose_output_dir).grid(row=14, column=2, padx=(6, 0), pady=5)
-        ttk.Checkbutton(page, text="配音完成后保留 TXT 文本", variable=self.keep_text_after_voice).grid(row=15, column=1, sticky="w", pady=5)
+        ttk.Button(page, text="LuxTTS 音色与声音克隆", command=self.open_lux_voice_manager).grid(row=8, column=1, sticky="w", pady=5)
+        ttk.Label(page, text="LuxTTS 的音色、随机名单和克隆样音在此单独管理。1.0 倍为正常速度。", wraplength=640).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="配音完成输出目录").grid(row=10, column=0, sticky="w", pady=5)
+        ttk.Entry(page, textvariable=self.output_dir, width=58).grid(row=10, column=1, sticky="ew", pady=5)
+        ttk.Button(page, text="选择文件夹", command=self.choose_output_dir).grid(row=10, column=2, padx=(6, 0), pady=5)
+        ttk.Checkbutton(page, text="配音完成后保留 TXT 文本", variable=self.keep_text_after_voice).grid(row=11, column=1, sticky="w", pady=5)
         page.columnconfigure(1, weight=1)
         buttons = ttk.Frame(page)
-        buttons.grid(row=16, column=1, sticky="w", pady=12)
+        buttons.grid(row=12, column=1, sticky="w", pady=12)
         ttk.Button(buttons, text="保存配音设置", command=self.save_voice).pack(side="left")
         ttk.Button(buttons, text="打开试听", command=lambda: self.open_folder(BASE_DIR / "试听")).pack(side="left")
+
+    def choose_lux_runtime_dir(self) -> None:
+        selected = filedialog.askdirectory(initialdir=self.lux_runtime_dir.get() or str(BASE_DIR))
+        if selected:
+            self.lux_runtime_dir.set(selected)
+
+    def open_lux_voice_manager(self) -> None:
+        from lux_voice_ui import open_lux_voice_manager
+        open_lux_voice_manager(self)
 
     def save_rewrite(self) -> bool:
         try:
@@ -876,7 +889,7 @@ class App(tk.Tk):
 
     def save_voice(self) -> bool:
         edge_settings = {"rate": self.rate.get().strip(), "pitch": self.pitch.get().strip(), "volume": self.volume.get().strip()}
-        if self.engine.get() in {"edge", "edge_then_aliyun"}:
+        if self.engine.get() in {"edge", "edge_then_lux"}:
             try:
                 edge_settings = validate_edge_settings(**edge_settings)
             except ValueError as exc:
@@ -885,27 +898,16 @@ class App(tk.Tk):
         if self.random_voice.get() and not self.random_voices:
             messagebox.showerror("无法保存", "请先选择至少一个随机音色，或取消“随机选择 Edge 音色”。")
             return False
-        if self.aliyun_random_voice.get() and not self.aliyun_random_voices:
-            messagebox.showerror("无法保存", "请先选择至少一个阿里云随机音色，或取消“随机选择阿里云音色”。")
-            return False
         try:
-            aliyun_rate = int(self.aliyun_rate.get())
-            aliyun_pitch = int(self.aliyun_pitch.get())
-            aliyun_volume = int(self.aliyun_volume.get())
-            if not (-500 <= aliyun_rate <= 500 and -500 <= aliyun_pitch <= 500 and 0 <= aliyun_volume <= 100):
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("无法保存", "阿里云语速、语调必须是 -500 到 500 的整数；音量必须是 0 到 100 的整数。")
+            lux_settings = validate_lux_settings(self.lux_runtime_dir.get(), self.lux_speed.get())
+        except ValueError as exc:
+            messagebox.showerror("无法保存", str(exc))
             return False
         data = voice_monitor.load_config()
         data.update({
             "input_dir": str(REWRITTEN_DIR), "output_dir": self.output_dir.get().strip() or str(COMPLETE_DIR), "source_after_success": "move_to_output", "keep_text_after_voice": self.keep_text_after_voice.get(),
-            "engine": self.engine.get(), "voice": self.voice.get(), **edge_settings,
-            "use_random_voice": self.random_voice.get(), "random_voices": self.random_voices, "aliyun_appkey": self.aliyun_appkey.get().strip(),
-            "aliyun_voice": self.aliyun_voice.get(), "aliyun_use_random_voice": self.aliyun_random_voice.get(), "aliyun_random_voices": self.aliyun_random_voices,
-            "aliyun_rate": aliyun_rate, "aliyun_pitch": aliyun_pitch, "aliyun_volume": aliyun_volume,
-            "aliyun_access_key_id_protected": protect(self.aliyun_id.get().strip()),
-            "aliyun_access_key_secret_protected": protect(self.aliyun_secret.get().strip()),
+            "engine": self.engine.get(), "voice": self.voice.get(), **edge_settings, **lux_settings,
+            "use_random_voice": self.random_voice.get(), "random_voices": self.random_voices,
         })
         voice_monitor.save_config(data)
         self.log("配音设置已保存。")
@@ -938,29 +940,6 @@ class App(tk.Tk):
 
     def update_random_voice_summary(self) -> None:
         self.random_voice_summary.set(f"已选 {len(self.random_voices)} 个")
-
-    def choose_aliyun_random_voices(self) -> None:
-        dialog = tk.Toplevel(self)
-        dialog.title("选择阿里云随机音色")
-        dialog.transient(self)
-        dialog.grab_set()
-        choices = {voice: tk.BooleanVar(value=voice in self.aliyun_random_voices) for voice in ALIYUN_VOICES}
-        for row, voice in enumerate(ALIYUN_VOICES):
-            ttk.Checkbutton(dialog, text=voice_display(voice, ALIYUN_VOICE_NAMES), variable=choices[voice]).grid(row=row // 2, column=row % 2, sticky="w", padx=14, pady=3)
-
-        def save() -> None:
-            self.aliyun_random_voices = normalize_aliyun_random_voices([voice for voice, selected in choices.items() if selected.get()])
-            self.update_aliyun_random_voice_summary()
-            dialog.destroy()
-
-        buttons = ttk.Frame(dialog, padding=10)
-        buttons.grid(row=16, column=0, columnspan=2)
-        ttk.Button(buttons, text="全选", command=lambda: [value.set(True) for value in choices.values()]).pack(side="left")
-        ttk.Button(buttons, text="清空", command=lambda: [value.set(False) for value in choices.values()]).pack(side="left", padx=6)
-        ttk.Button(buttons, text="保存选择", command=save).pack(side="left")
-
-    def update_aliyun_random_voice_summary(self) -> None:
-        self.aliyun_random_voice_summary.set(f"已选 {len(self.aliyun_random_voices)} 个")
 
     def edit_text_file(self, path: Path, title: str) -> None:
         dialog = tk.Toplevel(self)
@@ -1001,7 +980,7 @@ class App(tk.Tk):
             return
         if not self.save_voice():
             return
-        self.log("正在测试 AI、企业微信、Edge 和阿里云接口……")
+        self.log("正在测试 AI、企业微信、Edge 和已启用的本地 LuxTTS……")
         self._interface_test_active = True
         threading.Thread(target=self._test_interfaces, daemon=True).start()
 
@@ -1035,6 +1014,35 @@ class App(tk.Tk):
         text = test_edge_interface(config)
         self.log("Edge 测试完成。\n" + text)
         self.after(0, lambda: self._finish_interface_test("Edge 配音测试", text))
+
+    def start_lux_test(self) -> None:
+        if self._interface_test_active:
+            self.log("接口测试正在进行，请等待结果。")
+            return
+        try:
+            settings = validate_lux_settings(self.lux_runtime_dir.get(), self.lux_speed.get())
+        except ValueError as exc:
+            messagebox.showerror("无法试听 LuxTTS", str(exc))
+            return
+        config = voice_monitor.load_config()
+        config.update(settings)
+        self._interface_test_active = True
+        preview = BASE_DIR / "试听" / f"LuxTTS-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}.mp3"
+        self.log("正在生成本地 LuxTTS 试听，首次加载模型需要等待……")
+        threading.Thread(target=self._test_lux, args=(config, preview), daemon=True).start()
+
+    def _test_lux(self, config: dict, preview: Path) -> None:
+        text = test_lux_interface(config, preview_path=preview)
+        self.log("LuxTTS 试听完成。\n" + text)
+        self.after(0, lambda: self._finish_lux_preview(text, preview))
+
+    def _finish_lux_preview(self, text: str, preview: Path) -> None:
+        if text.startswith("正常") and preview.is_file():
+            try:
+                os.startfile(preview)
+            except OSError as exc:
+                text += f"\n试听已保存到 {preview}，自动播放失败：{exc}"
+        self._finish_interface_test("LuxTTS 配音试听", text)
 
     def _finish_interface_test(self, title: str, text: str) -> None:
         self._interface_test_active = False
@@ -1070,7 +1078,7 @@ class App(tk.Tk):
         recent = self.service.daily_stats.last_hour()
         self.today_stats.set(
             f"今日改小说：成功 {stats['rewrite_success']}  |  失败 {stats['rewrite_failed']}\n"
-            f"今日配音：成功 {stats['voice_success']}  |  失败 {stats['voice_failed']}  |  Edge {stats['edge_success']}  |  阿里云 {stats['aliyun_success']}\n"
+            f"今日配音：成功 {stats['voice_success']}  |  失败 {stats['voice_failed']}  |  Edge {stats['edge_success']}  |  LuxTTS {stats['lux_success']}\n"
             f"最近1小时：改写 {recent['rewrite_success']}  |  配音 {recent['voice_success']}  |  完整成品 {recent['voice_success']}"
         )
         self.progress.set(self.service.rewrite_progress_text())

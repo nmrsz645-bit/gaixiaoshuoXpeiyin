@@ -1,6 +1,6 @@
-# 小说处理中心 1.0.32-edge-test.1
+# 小说处理中心 1.0.32-lux-test.1
 
-当前分支是 2026-11-18 的本地 Edge 修复测试候选。Edge 依赖固定为 7.3.1，新配置默认在晓伊、晓晓间随机选择。界面新增“仅测试 Edge”，429 冷却和无音频重试共用实际配音路径。测试结果及范围见 [Edge 修复记录](docs/EDGE-REPAIR-20261118.md)。以下正式发布资料对应既有 1.0.31。
+当前分支是 2026-11-18 的 LuxTTS 功能测试候选。支持 Edge、本地 LuxTTS，以及 Edge 失败后转本地 LuxTTS。两种服务默认均从晓伊、晓晓选一位，LuxTTS 支持 0.5～2 倍语速、私人声音克隆和试听。阿里云配音功能已移除。先读 [本次功能记录](docs/LUX-VOICE-20261118.md)，此前 Edge 修复见 [Edge 记录](docs/EDGE-REPAIR-20261118.md)。以下历史正式发布资料对应 1.0.31。
 
 > 新 Windows 接手、环境、构建、版本、OSS/网站、验收回滚和凭据：**[完整发布指南](docs/RELEASE-GUIDE.md)**。
 
@@ -14,7 +14,7 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 - 本公开仓库维护正式版源码；测试版单独维护，不能误标为稳定版或擅自公开测试源码。
 - 正式版为 **1.0.31**。本版包含同名跳过、超过 24 小时的同名成品回收和自动流程页提示。GitHub Release 与 OSS 客户端更新分别验证。
 - 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md)。源码、构建源提交、测试及限制见 [1.0.31 变更说明](docs/releases/2026-11-10-v1.0.31.md)。
-- 本分支根 `version.json` 和源码显示回退值均为 **1.0.31**。源码启动读取该文件，构建也必须显式传 `--version 1.0.31`；旧标签中的 1.0.26 开发元数据已在后续维护分支修正，原 Windows 包和标签保持不变。
+- 当前测试分支根 `version.json` 和源码显示回退值均为 **1.0.32-lux-test.1**。测试构建显式传 `--version 1.0.32-lux-test.1`，带测试后缀的版本跳过更新器安装与检查。以下正式版流程示例仍使用 1.0.31，原 Windows 包和标签保持不变。
 
 ## GitHub Latest 兼容约束
 
@@ -24,7 +24,7 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 
 1. 从对应 Release 下载完整 Windows ZIP（测试版另提供安装 EXE），并用 `Get-FileHash -Algorithm SHA256` 与 `SHA256SUMS.txt` 核对。
 2. 解压到当前用户可写的新目录，保持 `Start-App.cmd`、`app/` 等原始层级；不要仅复制一个 EXE。已有安装先停止程序、关闭守护并备份整个旧目录，保留原队列、配置、回执和音频。
-3. 双击根目录 `Start-App.cmd`。Windows 包自带 Python 和 FFmpeg，运行时不需要安装 Python；AI、企业微信、Edge/阿里云语音均需要网络。
+3. 双击根目录 `Start-App.cmd`。Windows 包自带 Python 和 FFmpeg，运行时不需要安装 Python；AI、企业微信和 Edge 需要网络，LuxTTS 使用本机模型。
 4. 首次启动会在程序的 `app/` 内建立空白配置和工作目录，并尝试启动处理。缺少 Key/Webhook 时会提示配置未完成；先完成下节设置再启动业务。
 5. Windows 10/11 x64 为目标平台；本轮验证环境为 Windows x64、CPython 3.13.15。下载来源/安全提示需自行核对，不要通过关闭安全软件解决。
 
@@ -36,11 +36,11 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 | --- | --- |
 | AI 接口 | 在“改小说设置”选 DeepSeek 官方或自定义服务，填写本人有权使用的 API Key、完整接口 URL 和模型并保存。DeepSeek Key 在其[平台控制台](https://platform.deepseek.com/)创建；自定义接口由对应供应商提供。默认 URL 为 `https://api.deepseek.com/chat/completions`，默认模型 `deepseek-v4-flash`，每次最多 8000 字、等待 300 秒。 |
 | 企业微信 | 在本人有管理权限的群内添加机器人，取得 Webhook 并填入“改小说设置”。改写流程启动会校验 Key 和 Webhook；接口测试会真实向机器人发送消息。获取方式参见[企业微信群机器人文档](https://developer.work.weixin.qq.com/document/path/91770)。 |
-| Edge 语音 | “配音设置”选 `edge`，保存音色、语速、音量和音调。不需要阿里云凭据，但依赖在线 Edge 服务。 |
-| 阿里云语音 | 选 `aliyun` 或 `edge_then_aliyun` 时，在本人[智能语音控制台](https://nls-portal.console.aliyun.com/)取得项目 AppKey，并提供已获授权的 AccessKey ID/Secret。通过界面保存；不要扩大账号权限或把凭据写进仓库。 |
+| Edge 语音 | “配音设置”选 `edge`，保存音色、语速、音量和音调，使用在线 Edge 服务。 |
+| 本地 LuxTTS | 选 `lux_tts`，或选 `edge_then_lux` 作为 Edge 失败后的备用。选择破甲 GPU+CPU 完整包解压目录，设置 0.5～2.0 倍语速。通过“LuxTTS 音色与声音克隆”导入私人参考音频或选择默认两种参考音色。 |
 | 目录与规则 | 默认输入 `待改小说`，改写输出/配音输入必须同为 `已改完成`，最终输出 `完成`。在对应设置页保存目录、审改开关和指定违禁词。 |
 
-AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_webhook_url.txt`；语音配置在 `app/config.json`，改写配置在 `app/改写/config.json`。阿里云 AccessKey 使用 Windows DPAPI 保护，不能直接迁移到另一 Windows 用户后假定可解密。配置、规则、日志、正文和回执均属于用户本地数据，不随 Git 或 Release 分发。
+AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_webhook_url.txt`；语音配置在 `app/config.json`，改写配置在 `app/改写/config.json`。私人克隆音色存于 `app/lux-custom-voices`，迁移时需连同参考音频和元数据保存。配置、规则、日志、正文和回执均属于用户本地数据，不随 Git 或 Release 分发。
 
 ## 主要操作与实际处理规则
 
@@ -61,7 +61,7 @@ AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_w
 | 缺少 Key/Webhook，启动失败 | 在设置页补齐并保存。不要把真实配置上传到 GitHub 求助。 |
 | 同名文件仍在，跳过本书 | 本轮继续处理其他书。提示中的占用路径可定位 `.rewrite-processing`、配音输入、`.voice-processing` 或完成目录里的文件。旧成品回收日志记录原路径和回收位置。排查时保留任务 ID、时间、日志和事务文件。 |
 | 已改完成有 JSON，但等待配音为 0 | 默认配音只扫描 TXT；`.preparation.json` 是清理/备份/映射记录，`.semantic-review.json` 是审改/风险报告。`.rewrite-queue-names/*.json` 是任务原名关联，回执是防重/恢复依据；不能一概删除。 |
-| Edge 403、断网或阿里云失败 | 看 `app/voice_monitor.log` 和所选服务；`edge` 不会转阿里云，只有 `edge_then_aliyun` 会按配置回退。先保留 TXT/音频/回执，不对全部任务盲目重复合成。 |
+| Edge 或本地 LuxTTS 失败 | 看 `app/voice_monitor.log` 和所选服务。`edge_then_lux` 会在 Edge 失败后尝试本地合成。选择“仅测试 Edge”或“试听 LuxTTS”核对对应引擎。 |
 | 改写中断或发送结果不确定 | 保留 `.rewrite-processing`、重试/模式文件和发送凭据，先核实外部发送结果，再决定恢复，避免重复收费或重复发送。 |
 | 两端目录不一致 | 核对改写输出与配音输入是同一个实际路径，保存后重启需遵循任务停止边界。 |
 

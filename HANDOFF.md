@@ -1,4 +1,6 @@
-# 下一位 Codex：小说处理中心 Edge 修复测试
+# 下一位 Codex：小说处理中心 LuxTTS 功能测试
+
+当前候选 `1.0.32-lux-test.1`，源码分支 `codex/lux-voice-20261118`。本次已移除阿里云配音，加入 LuxTTS 调速、双默认参考音色、声音克隆与 Edge 失败回退。先读 [本次记录](docs/LUX-VOICE-20261118.md)，下文保留此前 Edge 与 1.0.31 历史信息。
 
 本地测试候选为 `1.0.32-edge-test.1`，源码基线 `0060015566198f293b6db546a61404f7257161fd`。先读 [本次修复记录](docs/EDGE-REPAIR-20261118.md)。2026-11-18 本地 432 项离线测试通过；两个 Edge 音色的完整测试小说均收到音频并通过 MP3 解码。故障电脑上的候选验证仍待回传。以下内容保留 1.0.31 正式版资料。
 
@@ -29,7 +31,7 @@
 | `text_preparation.py` | 位于 novel_monitor：章节行/数字行清理和 7000 字上限，原文位置映射。 |
 | `scene_document.py` / `scene_model.py` / `scene_review.py` | 位于 novel_monitor：主线事实/来源、场景编辑协议、独立核对、并行预算与风险报告。 |
 | `semantic_compliance.py` | 位于 novel_monitor：既有定向风险复核与兼容恢复逻辑。 |
-| `voice_monitor.py` / `aliyun_tts.py` | 配音领取/回执、原名输出、Edge/阿里云分支、失败恢复、音频校验及超时长裁剪。 |
+| `voice_monitor.py` / `lux_tts.py` / `lux_voice_store.py` | 配音领取/回执、原名输出、Edge/LuxTTS 分支、本地模型调用、语速与克隆音色、失败恢复、音频校验及超时长裁剪。 |
 | `novel_monitor/logging_setup.py` | 24 小时日志保留；不要把日志轮转当作业务进度清理。 |
 | `tools/build_github_release.py` / `prepare_domestic_release.py` | 新目录构建、ZIP/逐文件哈希清单、安排 OSS 待上传文件；不自动授权生产上传。 |
 | `updater-patch/` | 现有生产 UpdateAgent.exe 与公开地址配置，不含凭据；稳定版使用，测试版禁用启动。 |
@@ -97,7 +99,7 @@ API Key/Webhook 以本地文件保存，应通过 GUI 管理。阿里云 AccessK
 - 同名成品超过 24 小时时，改写与配音先回收完成目录根级的占用 TXT 或 MP3，再复查同名。取创建和最后修改时间的较晚者。旧文件通过同盘改名移入 `.expired-name-conflicts` 的独立子目录，保留原名与内容。排队和处理中任务、配音回执拥有的成品、与源目录重叠的位置保留原位。回收失败时仍跳过该书。
 - 当前主要验证限制：外部 AI/语音服务的可用性、真实业务发送/配音、客户升级、平台审核结论，以及本轮新安装/覆盖/卸载的 Windows 用户环境行为均未验收。包内代码和 ZIP/安装程序载荷已静态核对，见核验记录。
 - 已知安装边界：NSIS 的同名进程检查作用于当前系统同名 EXE；不要在生产程序仍运行时做安装测试。安装/卸载涉及桌面、开始菜单及 HKCU 项，必须先隔离，不能仅靠 /D 新目录假定完全无副作用。
-- 下一次修改先确认具体目标和授权；队列/发送问题优先读 processor/file_utils/monitor_service，配音问题读 voice_monitor/aliyun_tts，场景行为读 scene_review/text_preparation，界面/安装问题读 beta 的 ui_theme/installer。每次以实际源码和测试证据更新本文件。
+- 下一次修改先确认具体目标和授权；队列/发送问题优先读 processor/file_utils/monitor_service，配音问题读 voice_monitor/lux_tts/lux_voice_store，场景行为读 scene_review/text_preparation，界面/安装问题读 beta 的 ui_theme/installer。每次以实际源码和测试证据更新本文件。
 
 ## 更新器组件源码缺口
 
