@@ -1,6 +1,8 @@
-# 小说处理中心 1.0.32
+# 小说处理中心 1.0.33
 
-本版包含 Edge 修复、完整本地 LuxTTS、晓伊/晓晓默认随机、0.5～2 倍调速和私人声音克隆，并移除阿里云配音。模型、CPU/GPU 依赖随完整包及更新包分发，运行目录留空自动使用 `app/lux-runtime`，无需另装或选择破甲。见 [1.0.32 发布说明](docs/releases/2026-11-18-v1.0.32.md)。
+本版新增每日 AI 改写记录。在“自动流程”页打开日期 TXT，按书名看每处改写前后的文字。见 [1.0.33 发布说明](docs/releases/2026-11-23-v1.0.33.md)。
+
+Edge、本地 LuxTTS、晓伊/晓晓默认随机、0.5～2 倍调速和私人声音克隆延续 [1.0.32](docs/releases/2026-11-18-v1.0.32.md)。模型、CPU/GPU 依赖随完整包及更新包分发，运行目录留空自动使用 `app/lux-runtime`。
 
 提供 Edge、本地 LuxTTS，以及 Edge 失败后转本地 LuxTTS 三种模式。完整模型包约 5 GB；旧客户端首次升级的下载与临时解压约需额外 12.3 GB 空间，原安装和业务数据另计。测试候选的实际记录见 [Lux 功能](docs/LUX-VOICE-20261118.md)、[完整环境](docs/LUX-PORTABLE-20261118.md) 和 [Edge](docs/EDGE-REPAIR-20261118.md)。
 
@@ -12,15 +14,15 @@ Windows 本地 TXT 改写、风险片段审改、企业微信发送与自动配�
 
 ## 版本、源码和下载
 
-- 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.32) 提供完整 OSS 下载直链、校验文件与说明。大模型 ZIP 通过 OSS 分发。
+- 对应仓库：<https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin>，分支 `main`；[本版本 Release](https://github.com/nmrsz645-bit/gaixiaoshuoXpeiyin/releases/tag/v1.0.33) 提供完整 OSS 下载直链、校验文件与说明。大模型 ZIP 通过 OSS 分发。
 - 本公开仓库维护正式版源码；测试版单独维护，不能误标为稳定版或擅自公开测试源码。
-- 正式版为 **1.0.32**，保留 1.0.31 的同名跳过、24 小时同名成品回收和自动流程页提示。旧版说明见 [1.0.31](docs/releases/2026-11-10-v1.0.31.md)。
+- 正式版版本号为 **1.0.33**，保留 1.0.31 的同名跳过、24 小时同名成品回收和自动流程页提示。旧版说明见 [1.0.31](docs/releases/2026-11-10-v1.0.31.md)。
 - 开发者先读 [HANDOFF.md](HANDOFF.md)、[AGENTS.md](AGENTS.md) 和本次发布记录。源码、包、上传、网站和真实客户端验收分别报告。
-- 根 `version.json`、源码回退值及正式构建参数一致为 **1.0.32**。`build_github_release.py` 仅构建应用基础包，必须再经 `build_lux_release.py` 组合模型才能正式分发。带 `-` 后缀的测试版继续跳过更新器。
+- 根 `version.json`、源码回退值及正式构建参数一致为 **1.0.33**。`build_github_release.py` 仅构建应用基础包，必须再经 `build_lux_release.py` 组合模型才能正式分发。带 `-` 后缀的测试版继续跳过更新器。
 
 ## GitHub Latest 兼容约束
 
-最新正式程序为 1.0.32，使用上方版本专属 Release 链接下载。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
+正式下载使用上方版本专属 Release 链接。GitHub Latest 标记为保护 1.0.18 及以前客户端的旧清单入口而保留在 v1.0.18；不要据此误判最新版，也不要在补传时默认改变 Latest。详见 [旧客户端更新兼容](docs/legacy-github-update-compatibility.md)。
 
 ## Windows 安装与启动
 
@@ -56,7 +58,7 @@ AI Key 和 Webhook 分别保存在 `app/改写/deepseek_api_key.txt`、`wechat_w
 8. 新生成 MP3 超过 59 分钟时保留前 35 分钟；59 分钟及以内不裁，历史成品不回头处理。裁剪失败保留原音频和回执。
 9. 停止任务用界面“停止”；退出前关闭无人值守。不要强制清空处理中目录来解除等待。
 
-本地源码新增的“AI 改写记录”可在“自动流程”页打开。新任务完成改写并交付后，按改稿当天的日期写到 `app/改写/AI改写记录/YYYY-MM-DD.txt`。同一天的小说放在同一份 TXT，按原书名查看每处原文和改后文字。章节清理、截字和固定词替换不计入 AI 修改。没有保存过 AI 改稿对照的旧任务不会补录。
+“AI 改写记录”可在“自动流程”页打开。新任务完成改写并交付后，按改稿当天的日期写到 `app/改写/AI改写记录/YYYY-MM-DD.txt`。同一天的小说放在同一份 TXT，按原书名查看每处原文和改后文字。章节清理、截字和固定词替换不计入 AI 修改。没有保存过 AI 改稿对照的旧任务不会补录。
 
 ## 常见问题与取证
 
