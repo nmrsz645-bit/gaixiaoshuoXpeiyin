@@ -36,6 +36,7 @@ from novel_monitor.deepseek_client import (
 from novel_monitor.logging_setup import setup_logging
 from novel_monitor.file_utils import move_to_directory
 from novel_monitor.monitor_service import MonitorService
+from novel_monitor.rewrite_report import REWRITE_REPORT_DIR
 from novel_monitor.wecom_client import send_text_message
 
 
@@ -721,6 +722,7 @@ class App(tk.Tk):
         ttk.Button(folders, text="配音失败", command=lambda: self.open_folder(VOICE_FAILED_DIR)).pack(side="left", padx=(0, 6))
         ttk.Button(folders, text="重新尝试配音失败", command=self.retry_failed_voices).pack(side="left", padx=(0, 6))
         ttk.Button(folders, text="完成", command=lambda: self.open_folder(configured_output_dir(self.output_dir.get()))).pack(side="left", padx=(0, 6))
+        ttk.Button(folders, text="AI 改写记录", command=lambda: self.open_folder(REWRITE_DIR / REWRITE_REPORT_DIR)).pack(side="left")
         guard = ttk.Frame(page)
         guard.pack(anchor="w", pady=(14, 0))
         ttk.Label(guard, text="无人值守：").pack(side="left")
