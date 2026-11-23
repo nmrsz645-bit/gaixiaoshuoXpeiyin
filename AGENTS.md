@@ -1,6 +1,6 @@
 # 项目维护约定
 
-1. 先读 README.md、HANDOFF.md、docs/releases/2026-11-18-v1.0.32.md，再核对 git status、分支、HEAD 和远端。当前为 1.0.32 正式源码，历史 Lux/Edge 测试记录另存 docs/LUX-* 与 docs/EDGE-*。常规 build_github_release 只生成应用基础包，正式分发必须再运行 build_lux_release 组合模型。
+1. 先读 README.md、HANDOFF.md、docs/releases/2026-11-23-v1.0.33-results.md，再核对 git status、分支、HEAD 和远端。当前为 1.0.33 正式源码，历史 Lux/Edge 测试记录另存 docs/LUX-* 与 docs/EDGE-*。常规 build_github_release 只生成应用基础包，正式分发必须再运行 build_lux_release 组合模型。
 2. 权威源码是当前 Git checkout 根目录、novel_monitor/ 和 tools/。发布包、安装目录、业务目录、历史 build/验证副本均不是开发源。
 3. 保护用户配置、Key、Webhook、原文/备份、TXT/MP3、日志、队列/处理中、统计和回执；不清登录、不清锁、不重置真实任务、不覆盖未提交改动。同名只跳过该书，其他书继续；成品超过 24 小时按既有流程回收，不能改名绕过保护。
 4. 新功能或修复先隔离复现和离线回归；有真实接口/任务/发送/恢复/发布副作用时，依据当前明确授权边界执行，不复用历史授权。GitHub 发布不授权 OSS/更新清单/下载站变更。
