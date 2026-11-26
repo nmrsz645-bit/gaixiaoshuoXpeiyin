@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from .config import AppConfig
-from .deepseek_client import optimize_text
+from .deepseek_client import load_banned_rules, optimize_text
 from .wecom_client import send_text_message
 
 
@@ -16,17 +16,21 @@ def run_self_check(config: AppConfig, logger: logging.Logger) -> None:
         test_file.unlink()
         logger.info("目录读写正常: %s", directory)
 
-    result = optimize_text(
-        api_key=config.deepseek_api_key,
-        model=config.deepseek_model,
-        text="自检文本：请原样返回这句话。",
-        url=config.deepseek_url,
-        timeout=60,
-        validate_complete=False,
-    )
-    if not result:
-        raise RuntimeError("DeepSeek 自检返回为空")
-    logger.info("DeepSeek 连接正常")
+    if config.local_rewrite_only:
+        load_banned_rules(config.root)
+        logger.info("本地词表检查通过")
+    else:
+        result = optimize_text(
+            api_key=config.deepseek_api_key,
+            model=config.deepseek_model,
+            text="自检文本：请原样返回这句话。",
+            url=config.deepseek_url,
+            timeout=60,
+            validate_complete=False,
+        )
+        if not result:
+            raise RuntimeError("DeepSeek 自检返回为空")
+        logger.info("DeepSeek 连接正常")
 
     send_text_message(config.wechat_webhook_url, "改小说程序自检成功：企业微信群机器人连接正常。")
     logger.info("企业微信 Webhook 连接正常")

@@ -316,8 +316,8 @@ class ManagerGui:
 
     def start_monitor(self) -> None:
         self.save_config()
-        if not self.config.deepseek_api_key or not self.config.wechat_webhook_url:
-            messagebox.showwarning("配置不完整", "请先填写阿里云百炼 API Key 和企业微信 Webhook，然后保存配置。")
+        if not self.config.wechat_webhook_url:
+            messagebox.showwarning("配置不完整", "请先填写企业微信 Webhook，然后保存配置。")
             return
         if self.service and self.service.is_running():
             self.log("监控已经在运行")
@@ -354,13 +354,13 @@ class ManagerGui:
         def worker() -> None:
             try:
                 run_self_check(self.config, self.logger)
-                self.tk.after(0, lambda: show_result(True, "自检成功：DeepSeek 和企业微信连接正常。"))
+                self.tk.after(0, lambda: show_result(True, "自检成功：本地词表和企业微信检查通过。"))
             except Exception as exc:
                 error = str(exc) or exc.__class__.__name__
                 self.tk.after(0, lambda: show_result(False, f"自检失败：{error}"))
         self.save_config()
-        if not self.config.deepseek_api_key or not self.config.wechat_webhook_url:
-            messagebox.showwarning("配置不完整", "请先填写阿里云百炼 API Key 和企业微信 Webhook，然后保存配置。")
+        if not self.config.wechat_webhook_url:
+            messagebox.showwarning("配置不完整", "请先填写企业微信 Webhook，然后保存配置。")
             return
         self.status_vars["running"].set("自检中...")
         self.running_banner.configure(text="一键自检中...", bg="#f08c00", fg="white")

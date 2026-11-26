@@ -47,7 +47,7 @@ class PipelineTests(unittest.TestCase):
         logs = root / "logs"
         for folder in (source, output, failed, logs):
             folder.mkdir()
-        return AppConfig(root, source, output, failed, logs, "key", "webhook", "model", 0, 0, 3)
+        return AppConfig(root, source, output, failed, logs, "key", "webhook", "model", 0, 0, 3, local_rewrite_only=False)
 
     def test_semantic_mode_defaults_off_in_old_config(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2918,12 +2918,12 @@ class PipelineTests(unittest.TestCase):
             version_file.write_text('{"version": "1.0.21"}', encoding="utf-8")
             self.assertEqual(read_app_version((version_file,)), "1.0.21")
             version_file.write_text("not-json", encoding="utf-8")
-            self.assertEqual(read_app_version((version_file,)), "1.0.33")
+            self.assertEqual(read_app_version((version_file,)), "1.0.34")
             version_file.unlink()
-            self.assertEqual(read_app_version((version_file,)), "1.0.33")
-        self.assertEqual(DEFAULT_APP_VERSION, "1.0.33")
-        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.33")
-        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.33")
+            self.assertEqual(read_app_version((version_file,)), "1.0.34")
+        self.assertEqual(DEFAULT_APP_VERSION, "1.0.34")
+        self.assertEqual(read_app_version((Path(__file__).resolve().parent / "version.json",)), "1.0.34")
+        self.assertEqual(app_window_title(), "小说处理中心（改小说+配音） v1.0.34")
         self.assertEqual(app_window_title("v1.0.21"), "小说处理中心（改小说+配音） v1.0.21")
 
     def test_lux_random_voice_defaults_use_only_two_builtin_references(self):
@@ -2967,7 +2967,7 @@ class PipelineTests(unittest.TestCase):
                 return Response()
 
             (root / "ai_api_url.txt").write_text("https://workspace.cn-beijing.maas.aliyuncs.com/api/v1", encoding="utf-8")
-            results = test_interfaces(root, {"engine": "edge"}, ai_post=ai_post, edge_checker=edge_check)
+            results = test_interfaces(root, {"engine": "edge"}, ai_post=ai_post, edge_checker=edge_check, local_rewrite_only=False)
 
             self.assertEqual(results, {"AI": "正常", "企业微信": "未配置", "Edge": "正常", "LuxTTS": "未启用"})
             self.assertEqual(request_urls, ["https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"])

@@ -15,7 +15,7 @@ from .banned_rules_guard import banned_rules_guard
 from .deepseek_client import BannedRuleConfigError, BannedRulesChangedError, find_banned_terms, load_ad_compliance_rules, load_banned_rules, load_banned_terms, optimize_text, replace_banned_terms, request_signature, validate_optimized_text
 from .semantic_compliance import PROMPT_VERSION, summarize_risks
 from .scene_review import SceneReviewResult, review_scenes_and_rewrite as review_and_rewrite
-from .rewrite_report import capture_rewrite_changes, save_rewrite_report
+from .rewrite_report import capture_local_changes, capture_rewrite_changes, save_rewrite_report
 from dataclasses import asdict
 from .wecom_client import send_file
 from .text_preparation import REVISION as TEXT_PREPARATION_REVISION, prepare_text, remap_output_mapping
@@ -24,6 +24,7 @@ from .text_preparation import REVISION as TEXT_PREPARATION_REVISION, prepare_tex
 REWRITE_PROCESSING_DIR = ".rewrite-processing"
 LEGACY_WORK_DIR = ".rewrite-work"
 SEMANTIC_PIPELINE_REVISION = "core-preserving-scene-edit-v4-input-limits"
+LOCAL_REWRITE_DIR = "local-rewrite"
 
 
 class BannedTermError(ValueError):
@@ -79,7 +80,9 @@ def claim_source(source: Path, config: AppConfig) -> Path:
         claimed = job_dir / source.name
         try:
             settings_path = config.root / "config.json"
-            if settings_path.exists():
+            if config.local_rewrite_only:
+                enabled = False
+            elif settings_path.exists():
                 settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
                 enabled = isinstance(settings, dict) and settings.get("semanticComplianceEnabled") is True
             else:
@@ -357,6 +360,47 @@ def discard_job(source: Path, config: AppConfig) -> None:
             return
 
 
+def _delivery_signature(request: str, text_sha256: str) -> str:
+    return hashlib.sha256((request + "\0" + text_sha256).encode("ascii")).hexdigest()
+
+
+def _find_sent_rewrite(job_dir: Path, name: str, source_sha256: str) -> Path | None:
+    """Use a verifiable receipt from either version before changing any staged text."""
+    for directory in (job_dir / LOCAL_REWRITE_DIR, job_dir / "rewrite"):
+        receipts = sorted(directory.glob("webhook.*.sent"))
+        if not receipts:
+            continue
+        staged = directory / "staged" / name
+        state = _load_publish_state(directory / "staged.json")
+        request = state.get("request_signature")
+        try:
+            if staged.is_file() and isinstance(request, str) and re.fullmatch(r"[0-9a-f]{64}", request):
+                prepared = state.get("text_preparation")
+                recorded_source = state.get("source_sha256") or (
+                    prepared.get("source_sha256") if isinstance(prepared, dict) else None
+                )
+                published = _load_publish_state(job_dir / "publish.json")
+                text_sha = hashlib.sha256(staged.read_bytes()).hexdigest()
+                if (not recorded_source or recorded_source == source_sha256) and published.get("text_sha256", text_sha) == text_sha:
+                    signature = _delivery_signature(request, text_sha)
+                    for receipt in receipts:
+                        try:
+                            saved = receipt.read_text(encoding="utf-8")
+                            legacy = not state.get("semantic_review_complete") and (
+                                saved == text_sha or (saved == "sent" and receipt.stat().st_mtime_ns >= staged.stat().st_mtime_ns)
+                            )
+                        except (OSError, UnicodeError):
+                            continue
+                        if saved == signature or legacy:
+                            return directory
+        except OSError as exc:
+            raise BannedRuleConfigError("已有发送回执，暂存文件暂时无法读取，已保留任务等待核对") from exc
+        raise BannedRuleConfigError("已有企业微信发送回执，但原文或暂存稿无法核对，已保留任务等待核对")
+    if (job_dir / "publish.json").exists():
+        raise BannedRuleConfigError("已有配音交付记录，但缺少可核对的发送回执，已保留任务等待核对")
+    return None
+
+
 def process_file(
     source: Path,
     config: AppConfig,
@@ -364,13 +408,14 @@ def process_file(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> Path:
     source = Path(source)
-    extra_rules = load_ad_compliance_rules(config.root)
+    local = config.local_rewrite_only
+    extra_rules = "" if local else load_ad_compliance_rules(config.root)
     banned_terms, replacements = load_banned_rules(config.root)
 
     def ensure_rules_unchanged() -> None:
         if load_banned_rules(config.root) != (banned_terms, replacements):
             raise BannedRulesChangedError("指定违禁词在处理期间改变，已暂停发送，将按新规则重新处理")
-        if enabled and load_ad_compliance_rules(config.root) != extra_rules:
+        if not local and enabled and load_ad_compliance_rules(config.root) != extra_rules:
             raise BannedRulesChangedError("补充合规规则在处理期间改变，已暂停发送，将按新规则重新处理")
 
     if not is_claimed_source(source, config):
@@ -380,38 +425,49 @@ def process_file(
             belongs_to_input = False
         if belongs_to_input:
             source = claim_source(source, config)
-    enabled = semantic_mode_for_job(source, config)
+    enabled = not local and semantic_mode_for_job(source, config)
     logger.info("开始处理: %s", source)
     raw_source = source.read_bytes()
     source_sha256 = hashlib.sha256(raw_source).hexdigest()
-    original_text = read_source_text(source)
-    preparation = prepare_text(original_text)
-    text = preparation.text
+    if local:
+        try:
+            original_text = raw_source.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            original_text = raw_source.decode("gb18030")
+    else:
+        original_text = read_source_text(source)
+    preparation = None if local else prepare_text(original_text)
+    text = preparation.text if preparation else original_text
     post_limit_actions = ()
 
     def ensure_source_unchanged() -> None:
-        if (enabled or preparation.actions or post_limit_actions) and hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+        requires_check = local or enabled or (preparation is not None and preparation.actions) or post_limit_actions
+        if requires_check and hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+            if local:
+                raise BannedRuleConfigError("原文在本地处理期间改变，已保留原件等待重试")
             raise RuntimeError("原文在语义复核期间改变，已暂停发送")
 
     ensure_source_unchanged()
-    preparation_info = dict(revision=TEXT_PREPARATION_REVISION,source_sha256=source_sha256,
-        original_characters=preparation.original_characters,prepared_characters=preparation.prepared_characters,
-        prepared_source_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(),
-        input_actions=list(preparation.actions),original_to_prepared=list(preparation.kept_spans),final_actions=[])
-    if preparation.actions:
-        preparation_info.update(_save_preparation_backup(source,config,raw_source,source_sha256,text))
-        logger.info('正文预处理完成：文件=%s，原字符数=%s，送审字符数=%s，清理动作=%s；仅对保留正文审改',
-                    source.name,preparation.original_characters,preparation.prepared_characters,len(preparation.actions))
+    if preparation is not None:
+        preparation_info = dict(revision=TEXT_PREPARATION_REVISION,source_sha256=source_sha256,
+            original_characters=preparation.original_characters,prepared_characters=preparation.prepared_characters,
+            prepared_source_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(),
+            input_actions=list(preparation.actions),original_to_prepared=list(preparation.kept_spans),final_actions=[])
+        if preparation.actions:
+            preparation_info.update(_save_preparation_backup(source,config,raw_source,source_sha256,text))
+            logger.info('正文预处理完成：文件=%s，原字符数=%s，送审字符数=%s，清理动作=%s；仅对保留正文审改',
+                        source.name,preparation.original_characters,preparation.prepared_characters,len(preparation.actions))
     if is_claimed_source(source, config):
         job_id = source.parent.name
         job_dir = source.parent
     else:
         job_id = _job_key(source, original_text, config, extra_rules, banned_terms)
         job_dir = config.root / LEGACY_WORK_DIR / job_id
-    rewrite_dir = job_dir / "rewrite"
+    sent_directory = _find_sent_rewrite(job_dir, source.name, source_sha256) if local else None
+    rewrite_dir = sent_directory or job_dir / (LOCAL_REWRITE_DIR if local else "rewrite")
     staged = rewrite_dir / "staged" / source.name
     staged_metadata = rewrite_dir / "staged.json"
-    ai_signature = request_signature(config.deepseek_model, config.deepseek_url, extra_rules, banned_terms)
+    ai_signature = "" if local else request_signature(config.deepseek_model, config.deepseek_url, extra_rules, banned_terms)
     generation_signature = ai_signature
     if replacements:
         generation_signature = hashlib.sha256(
@@ -425,7 +481,7 @@ def process_file(
     webhook_sent = rewrite_dir / f"webhook.{webhook_key}.sent"
 
     staged_state = _load_publish_state(staged_metadata)
-    stage_valid = staged.exists() and staged_state.get("request_signature") == generation_signature
+    stage_valid = not local and staged.exists() and staged_state.get("request_signature") == generation_signature
     legacy_preparation_sent_recovery = False
     if stage_valid and staged_state.get('text_preparation_revision') != TEXT_PREPARATION_REVISION:
         digest = hashlib.sha256(staged.read_bytes()).hexdigest()
@@ -448,9 +504,44 @@ def process_file(
                 generation_signature + "\0" + hashlib.sha256(staged.read_bytes()).hexdigest()
             ).encode("ascii")).hexdigest()
             stage_valid = webhook_sent.exists() and webhook_sent.read_text(encoding="utf-8") == prior_delivery_signature
-    if not text.strip() and not (stage_valid and legacy_preparation_sent_recovery):
+    if not text.strip() and not sent_directory and not (stage_valid and legacy_preparation_sent_recovery):
+        if local:
+            raise ValueError("没有可处理的正文，原文已保留")
         raise ValueError('按指定行清理规则处理后没有正文，原文已保留，不调用接口或配音')
-    if stage_valid:
+    if local:
+        if sent_directory:
+            optimized = staged.read_text(encoding="utf-8-sig")
+            enabled = staged_state.get("semantic_review_complete") is True
+            legacy_preparation_sent_recovery = staged_state.get("text_preparation_revision") != TEXT_PREPARATION_REVISION
+            if enabled and not legacy_preparation_sent_recovery:
+                text = prepare_text(original_text).text
+            remaining_terms = find_banned_terms(optimized, banned_terms)
+            if remaining_terms:
+                raise BannedRuleConfigError("已发送的暂存稿与当前指定违禁词不符，已保留原任务和回执等待核对")
+            logger.info("已核对发送回执，沿用原稿继续交付：%s", source.name)
+        else:
+            counts: dict[str, int] = {}
+            optimized = replace_banned_terms(text, replacements, counts=counts)
+            remaining_terms = find_banned_terms(optimized, banned_terms)
+            if not remaining_terms:
+                if not optimized.strip():
+                    raise ValueError("本地处理后没有正文，保留原文，不发送或配音")
+                generation_signature = hashlib.sha256(json.dumps({
+                    "mode": "local-words-v1", "source_sha256": source_sha256,
+                    "terms": banned_terms, "replacements": replacements,
+                }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                saved_report = staged_state.get("local_change_report")
+                if staged_state.get("request_signature") != generation_signature or not isinstance(saved_report, dict):
+                    saved_report = capture_local_changes(replacements, counts)
+                ensure_rules_unchanged()
+                ensure_source_unchanged()
+                _atomic_write_text(staged, optimized, verbatim=True)
+                _atomic_write_json(staged_metadata, {
+                    "version": 1, "request_signature": generation_signature,
+                    "source_sha256": source_sha256,
+                    "local_change_report": saved_report,
+                })
+    elif stage_valid:
         optimized = staged.read_text(encoding="utf-8-sig")
         remaining_terms = find_banned_terms(optimized, banned_terms)
         if not remaining_terms and not legacy_preparation_sent_recovery and not staged_state.get("banned_mask_applied") and not staged_state.get('text_preparation',{}).get('final_actions') and not (enabled and staged_state.get("version") == 2):
@@ -638,6 +729,8 @@ def process_file(
                 metadata["ai_change_report"] = capture_rewrite_changes(ai_input, ai_output)
             _atomic_write_json(staged_metadata, metadata)
     if remaining_terms:
+        if local and (job_dir / "rewrite" / "staged.json").exists():
+            raise BannedRuleConfigError("本地词表仍有未替换的禁词，已保留原文与旧暂存稿，等待补全词表")
         raise BannedTermError(f"指定违禁词没有可用替换词或替换后仍存在，未输出未发送：{'、'.join(remaining_terms)}")
 
     if enabled and _load_publish_state(staged_metadata).get("semantic_review_complete") is not True:
@@ -645,18 +738,20 @@ def process_file(
 
     ensure_rules_unchanged()
     ensure_source_unchanged()
-    delivery_signature = hashlib.sha256((generation_signature + "\0" + hashlib.sha256(staged.read_bytes()).hexdigest()).encode("ascii")).hexdigest()
-    sent_signature = webhook_sent.read_text(encoding="utf-8") if webhook_sent.exists() else ""
-    legacy_sent_for_current_stage = (
-        not enabled and sent_signature == "sent" and staged.exists()
-        and webhook_sent.stat().st_mtime_ns >= staged.stat().st_mtime_ns
-    )
-    if sent_signature != delivery_signature and not legacy_sent_for_current_stage:
-        ensure_source_unchanged()
-        send_file(config.wechat_webhook_url, staged)
-        ensure_rules_unchanged()
-        _atomic_write_text(webhook_sent, delivery_signature)
-        logger.info("已发送企业微信文件: %s", staged.name)
+    if sent_directory is None:
+        delivery_signature = _delivery_signature(generation_signature, hashlib.sha256(staged.read_bytes()).hexdigest())
+        sent_signature = webhook_sent.read_text(encoding="utf-8") if webhook_sent.exists() else ""
+        legacy_sent_for_current_stage = (
+            not enabled and sent_signature == "sent" and staged.exists()
+            and webhook_sent.stat().st_mtime_ns >= staged.stat().st_mtime_ns
+        )
+        if sent_signature != delivery_signature and not legacy_sent_for_current_stage:
+            ensure_source_unchanged()
+            send_file(config.wechat_webhook_url, staged)
+            if not local:
+                ensure_rules_unchanged()
+            _atomic_write_text(webhook_sent, delivery_signature)
+            logger.info("已发送企业微信文件: %s", staged.name)
 
     with banned_rules_guard(config.root):
         ensure_rules_unchanged()
@@ -724,7 +819,7 @@ def process_file(
             _atomic_write_json(preparation_path,preparation_state)
 
     if source.exists():
-        report = final_state.get("ai_change_report")
+        report = final_state.get("local_change_report", final_state.get("ai_change_report"))
         if isinstance(report, dict):
             ensure_source_unchanged()
             try:

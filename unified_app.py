@@ -72,7 +72,7 @@ _INSTANCE_MUTEX = None
 UPDATE_CHECK_INITIAL_DELAY_MS = 30_000
 UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000
 APP_VERSION_FILE_NAME = "version.json"
-DEFAULT_APP_VERSION = "1.0.33"
+DEFAULT_APP_VERSION = "1.0.34"
 OFFICIAL_AI_SERVICE = "DeepSeek官方"
 BAILIAN_AI_SERVICE = "阿里云百炼"
 CUSTOM_AI_SERVICE = "自定义"
@@ -403,24 +403,28 @@ def test_lux_interface(voice_config: dict, lux_checker=None, preview_path: Path 
         return f"失败：{str(exc).splitlines()[0]}（{type(exc).__name__}，{time.monotonic() - started:.1f} 秒）"
 
 
-def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.post, wecom_sender=send_text_message, edge_checker=None, lux_checker=None) -> dict[str, str]:
+def test_interfaces(rewrite_root: Path, voice_config: dict, ai_post=requests.post, wecom_sender=send_text_message,
+                    edge_checker=None, lux_checker=None, *, local_rewrite_only: bool = True) -> dict[str, str]:
     results: dict[str, str] = {}
-    api_key = (rewrite_root / "deepseek_api_key.txt").read_text(encoding="utf-8-sig").strip()
-    api_url = _chat_completions_url((rewrite_root / "ai_api_url.txt").read_text(encoding="utf-8-sig").strip())
-    model = json.loads((rewrite_root / "config.json").read_text(encoding="utf-8-sig")).get("deepseekModel", "deepseek-v4-flash")
-    try:
-        if not api_key:
-            raise ValueError("未填写 AI API Key")
-        request_body = {"model": model, "messages": [{"role": "user", "content": "Reply OK."}], "max_tokens": 32}
-        if is_deepseek_official_url(api_url):
-            request_body["thinking"] = {"type": "disabled"}
-        elif is_aliyun_bailian_url(api_url):
-            request_body["enable_thinking"] = False
-        response = ai_post(api_url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=request_body, timeout=30)
-        response.raise_for_status()
-        results["AI"] = "正常"
-    except Exception as exc:
-        results["AI"] = f"失败：{str(exc).splitlines()[0]}"
+    if local_rewrite_only:
+        results["AI"] = "未启用（使用本地词替换）"
+    else:
+        try:
+            api_key = (rewrite_root / "deepseek_api_key.txt").read_text(encoding="utf-8-sig").strip()
+            api_url = _chat_completions_url((rewrite_root / "ai_api_url.txt").read_text(encoding="utf-8-sig").strip())
+            model = json.loads((rewrite_root / "config.json").read_text(encoding="utf-8-sig")).get("deepseekModel", "deepseek-v4-flash")
+            if not api_key:
+                raise ValueError("未填写 AI API Key")
+            request_body = {"model": model, "messages": [{"role": "user", "content": "Reply OK."}], "max_tokens": 32}
+            if is_deepseek_official_url(api_url):
+                request_body["thinking"] = {"type": "disabled"}
+            elif is_aliyun_bailian_url(api_url):
+                request_body["enable_thinking"] = False
+            response = ai_post(api_url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=request_body, timeout=30)
+            response.raise_for_status()
+            results["AI"] = "正常"
+        except Exception as exc:
+            results["AI"] = f"失败：{str(exc).splitlines()[0]}"
 
     webhook = (rewrite_root / "wechat_webhook_url.txt").read_text(encoding="utf-8-sig").strip()
     try:
@@ -1091,7 +1095,7 @@ class App(tk.Tk):
             if self._update_process is None or self._update_process.poll() is not None:
                 self._update_process = launch_update_check()
         except Exception as exc:
-            self.log(f"自动更新检查失败：{exc}")
+            logging.warning("自动更新检查失败（%s）", type(exc).__name__)
         finally:
             self.after(UPDATE_CHECK_INTERVAL_MS, self.check_for_updates)
 

@@ -26,6 +26,7 @@ class AppConfig:
     max_request_chars: int = 8000
     request_timeout_seconds: int = 300
     semantic_compliance_enabled: bool = False
+    local_rewrite_only: bool = True
 
 
 def _read_required_text(path: Path, label: str, allow_blank: bool = False, default: str = "") -> str:
@@ -94,7 +95,7 @@ def load_config(root: Path, allow_blank_secrets: bool = False, portable_defaults
         output_dir=output_dir,
         failed_dir=failed_dir,
         log_dir=log_dir,
-        deepseek_api_key=_read_required_text(root / "deepseek_api_key.txt", "DeepSeek API Key", allow_blank_secrets),
+        deepseek_api_key=_read_optional_text(root / "deepseek_api_key.txt", ""),
         wechat_webhook_url=_read_required_text(root / "wechat_webhook_url.txt", "企业微信 Webhook", allow_blank_secrets),
         deepseek_model=data.get("deepseekModel", "deepseek-v4-flash"),
         stable_seconds=int(data.get("stableSeconds", 15)),

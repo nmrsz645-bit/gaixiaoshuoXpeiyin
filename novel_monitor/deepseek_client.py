@@ -20,10 +20,10 @@ MAX_COMPLETE_RATIO = 1.3
 CHECKPOINT_CACHE_VERSION = 4
 RULES_FILE_NAME = "抖音广告合规规则.txt"
 BANNED_TERMS_FILE_NAME = "指定违禁词.txt"
-DEFAULT_BANNED_TERMS = """# 每行填写一个违禁词，可用“原词=替换词”指定改写后的固定替换。
+DEFAULT_BANNED_TERMS = """# 每行填写一组“原词=替换词”，程序在本地按原词精确替换。
 # 例如：抓奸=揭露
-# 只写原词不填替换词时：未勾选语义复核仍按原流程进入改写失败；勾选后会在最终成稿中自动遮盖并继续。
-# 替换词不能包含任何违禁词；勾选语义复核后的遮盖可能损伤剧情事实，也不能保证平台审核通过。
+# 只写原词不填替换词时，命中该词的原文会保留，暂不发送或配音。
+# 替换词不能包含任何违禁词。
 # 空行和以 # 开头的说明行会被忽略。
 """
 
@@ -92,11 +92,18 @@ def find_banned_terms(text: str, banned_terms: tuple[str, ...]) -> tuple[str, ..
     return tuple(term for term in banned_terms if term in text)
 
 
-def replace_banned_terms(text: str, replacements: dict[str, str]) -> str:
+def replace_banned_terms(text: str, replacements: dict[str, str], *, counts: dict[str, int] | None = None) -> str:
     if not replacements:
         return text
     pattern = re.compile("|".join(re.escape(term) for term in sorted(replacements, key=len, reverse=True)))
-    return pattern.sub(lambda match: replacements[match.group()], text)
+
+    def replace(match: re.Match) -> str:
+        term = match.group()
+        if counts is not None:
+            counts[term] = counts.get(term, 0) + 1
+        return replacements[term]
+
+    return pattern.sub(replace, text)
 
 
 def is_deepseek_official_url(url: str) -> bool:

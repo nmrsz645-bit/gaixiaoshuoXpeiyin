@@ -205,12 +205,13 @@ class EdgeSettingsTests(unittest.TestCase):
             async def edge_check(config):
                 return None
 
-            response = SimpleNamespace(raise_for_status=lambda: None)
+            ai_post = Mock(side_effect=AssertionError("AI was not enabled"))
             local_check = Mock(side_effect=AssertionError("Lux was not enabled"))
             result = unified_app.test_interfaces(root, {"engine": "edge", "aliyun_appkey": "old-data"},
-                                                ai_post=Mock(return_value=response), edge_checker=edge_check,
+                                                ai_post=ai_post, edge_checker=edge_check,
                                                 lux_checker=local_check)
-        self.assertEqual(result, {"AI": "正常", "企业微信": "未配置", "Edge": "正常", "LuxTTS": "未启用"})
+        self.assertEqual(result, {"AI": "未启用（使用本地词替换）", "企业微信": "未配置", "Edge": "正常", "LuxTTS": "未启用"})
+        ai_post.assert_not_called()
         local_check.assert_not_called()
 
     def test_lux_preview_file_survives_helper_and_refuses_existing_file(self):
