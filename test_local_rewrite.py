@@ -2,6 +2,7 @@ import logging
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,6 +52,10 @@ class LocalRewriteTests(unittest.TestCase):
         )
         (self.root / "config.json").write_text('{"semanticComplianceEnabled": true}', encoding="utf-8")
         self.write_rules("甲=短词\n甲乙=长词\n")
+        history = self.root / "AI改写记录"
+        history.mkdir()
+        old_report = history / f"{date.today().isoformat()}.txt"
+        old_report.write_bytes("历史日报\r\n".encode("utf-8"))
         unchanged = "原" * 7100 + "尾声还在。"
         source = self.write_source("第1章 标题\r\n甲乙以及甲。\r\n" + unchanged)
         sent = []
@@ -65,6 +70,8 @@ class LocalRewriteTests(unittest.TestCase):
         expected = ("第1章 标题\r\n长词以及短词。\r\n" + unchanged).encode("utf-8")
         self.assertEqual(output.read_bytes(), expected)
         self.assertEqual(sent, [expected])
+        self.assertEqual(list(history.iterdir()), [old_report])
+        self.assertEqual(old_report.read_bytes(), "历史日报\r\n".encode("utf-8"))
 
     def test_unmapped_word_blocks_delivery(self):
         self.write_rules("旧词=新词\n缺少替换\n")

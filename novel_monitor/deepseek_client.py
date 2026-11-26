@@ -92,18 +92,12 @@ def find_banned_terms(text: str, banned_terms: tuple[str, ...]) -> tuple[str, ..
     return tuple(term for term in banned_terms if term in text)
 
 
-def replace_banned_terms(text: str, replacements: dict[str, str], *, counts: dict[str, int] | None = None) -> str:
+def replace_banned_terms(text: str, replacements: dict[str, str]) -> str:
     if not replacements:
         return text
     pattern = re.compile("|".join(re.escape(term) for term in sorted(replacements, key=len, reverse=True)))
 
-    def replace(match: re.Match) -> str:
-        term = match.group()
-        if counts is not None:
-            counts[term] = counts.get(term, 0) + 1
-        return replacements[term]
-
-    return pattern.sub(replace, text)
+    return pattern.sub(lambda match: replacements[match.group()], text)
 
 
 def is_deepseek_official_url(url: str) -> bool:

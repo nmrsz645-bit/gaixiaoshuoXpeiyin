@@ -15,7 +15,6 @@ from .banned_rules_guard import banned_rules_guard
 from .deepseek_client import BannedRuleConfigError, BannedRulesChangedError, find_banned_terms, load_ad_compliance_rules, load_banned_rules, load_banned_terms, optimize_text, replace_banned_terms, request_signature, validate_optimized_text
 from .semantic_compliance import PROMPT_VERSION, summarize_risks
 from .scene_review import SceneReviewResult, review_scenes_and_rewrite as review_and_rewrite
-from .rewrite_report import capture_local_changes, capture_rewrite_changes, save_rewrite_report
 from dataclasses import asdict
 from .wecom_client import send_file
 from .text_preparation import REVISION as TEXT_PREPARATION_REVISION, prepare_text, remap_output_mapping
@@ -520,8 +519,7 @@ def process_file(
                 raise BannedRuleConfigError("已发送的暂存稿与当前指定违禁词不符，已保留原任务和回执等待核对")
             logger.info("已核对发送回执，沿用原稿继续交付：%s", source.name)
         else:
-            counts: dict[str, int] = {}
-            optimized = replace_banned_terms(text, replacements, counts=counts)
+            optimized = replace_banned_terms(text, replacements)
             remaining_terms = find_banned_terms(optimized, banned_terms)
             if not remaining_terms:
                 if not optimized.strip():
@@ -530,16 +528,12 @@ def process_file(
                     "mode": "local-words-v1", "source_sha256": source_sha256,
                     "terms": banned_terms, "replacements": replacements,
                 }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-                saved_report = staged_state.get("local_change_report")
-                if staged_state.get("request_signature") != generation_signature or not isinstance(saved_report, dict):
-                    saved_report = capture_local_changes(replacements, counts)
                 ensure_rules_unchanged()
                 ensure_source_unchanged()
                 _atomic_write_text(staged, optimized, verbatim=True)
                 _atomic_write_json(staged_metadata, {
                     "version": 1, "request_signature": generation_signature,
                     "source_sha256": source_sha256,
-                    "local_change_report": saved_report,
                 })
     elif stage_valid:
         optimized = staged.read_text(encoding="utf-8-sig")
@@ -548,8 +542,6 @@ def process_file(
             validate_optimized_text(text, optimized, check_length=not replacements and not staged_state.get("banned_mask_applied"))
     else:
         review_status = "complete"
-        ai_input = text
-        ai_output = None
         remaining_risks = ()
         risk_actions = ()
         mask_applied = False
@@ -572,7 +564,6 @@ def process_file(
                 timeout=config.request_timeout_seconds,
             )
             validate_optimized_text(text, optimized)
-            ai_output = optimized
 
         ensure_rules_unchanged()
         ensure_source_unchanged()
@@ -611,9 +602,6 @@ def process_file(
                 review_status = "unverified"
                 logger.warning("语义复核故障，保留上一份有效文本：文件=%s，错误类型=%s", source.name, type(exc).__name__)
             else:
-                # The scene compiler edits the prepared source. Older adapters edit the current draft.
-                ai_input = text if isinstance(result, SceneReviewResult) else optimized
-                ai_output = candidate
                 optimized = candidate
                 review_status = result.review_status if review_status == "complete" else review_status
                 remaining_risks = result.remaining_risks
@@ -725,8 +713,6 @@ def process_file(
                         {"id": risk.id, "category": risk.category} for risk in remaining_risks
                         if risk.category == "fidelity"
                     ]
-            if ai_output is not None and (not enabled or metadata["semantic_review_complete"]):
-                metadata["ai_change_report"] = capture_rewrite_changes(ai_input, ai_output)
             _atomic_write_json(staged_metadata, metadata)
     if remaining_terms:
         if local and (job_dir / "rewrite" / "staged.json").exists():
@@ -809,8 +795,7 @@ def process_file(
         else:
             _atomic_write_json(report_path, review_report)
 
-    final_state = _load_publish_state(staged_metadata)
-    preparation_state = final_state.get('text_preparation')
+    preparation_state = _load_publish_state(staged_metadata).get('text_preparation')
     if preparation_state and (preparation_state['input_actions'] or preparation_state['final_actions']):
         preparation_path = output_path.with_suffix('.preparation.json')
         if preparation_path.exists() and _load_publish_state(preparation_path) != preparation_state:
@@ -819,13 +804,6 @@ def process_file(
             _atomic_write_json(preparation_path,preparation_state)
 
     if source.exists():
-        report = final_state.get("local_change_report", final_state.get("ai_change_report"))
-        if isinstance(report, dict):
-            ensure_source_unchanged()
-            try:
-                save_rewrite_report(config.root, source.name, job_id, report)
-            except (OSError, ValueError, TypeError, KeyError) as exc:
-                logger.warning("AI 改写记录保存失败：%s（%s）", source.name, type(exc).__name__)
         ensure_source_unchanged()
         source.unlink()
         logger.info("已删除源文件: %s", source)

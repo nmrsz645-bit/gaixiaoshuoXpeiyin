@@ -8,7 +8,6 @@ import tempfile
 import threading
 import unittest
 import requests
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from dataclasses import replace
 from pathlib import Path
@@ -2780,18 +2779,20 @@ class PipelineTests(unittest.TestCase):
             root = Path(temporary)
             config = replace(self.rewrite_config(root), semantic_compliance_enabled=True)
             source = config.input_dir / "novel.txt"
-            source.write_text("第一章 林间\n" + original, encoding="utf-8")
+            source_text = "第一章 林间\n" + original
+            source.write_text(source_text, encoding="utf-8")
             (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("赶路=前行\n", encoding="utf-8")
-            report_dir = root / "AI改写记录"
             logger = logging.getLogger("test-semantic")
             with patch.object(rewrite_processor, "optimize_text", side_effect=AssertionError("unexpected first pass")), \
                  patch.object(rewrite_processor, "review_and_rewrite", return_value=reviewed) as review, \
                  patch.object(rewrite_processor, "send_file", side_effect=RuntimeError("webhook failed")):
                 with self.assertRaisesRegex(RuntimeError, "webhook failed"):
                     rewrite_processor.process_file(source, config, logger)
-            self.assertEqual(list(report_dir.glob("*.txt")), [])
-            claimed = rewrite_processor.recover_claimed_sources(config)[0]
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [])
+            claimed, = rewrite_processor.recover_claimed_sources(config)
+            self.assertEqual(claimed.read_text(encoding="utf-8"), source_text)
             unlink = Path.unlink
+            expected = "暮色已经降临。\n旅人继续前行。"
 
             def fail_source_cleanup(path, *args, **kwargs):
                 if path == claimed:
@@ -2804,21 +2805,17 @@ class PipelineTests(unittest.TestCase):
                 with patch.object(Path, "unlink", new=fail_source_cleanup):
                     with self.assertRaisesRegex(PermissionError, "source temporarily locked"):
                         rewrite_processor.process_file(claimed, config, logger)
-                report, = report_dir.glob("*.txt")
-                report_before_retry = report.read_bytes()
+                send.assert_called_once()
+                published, = config.output_dir.glob("*.txt")
+                self.assertEqual(published.read_text(encoding="utf-8"), expected)
+                self.assertEqual(claimed.read_text(encoding="utf-8"), source_text)
                 result = rewrite_processor.process_file(claimed, config, logger)
-                self.assertEqual(report.read_bytes(), report_before_retry)
             review.assert_called_once()
             send.assert_called_once()
-            self.assertEqual(result.read_text(encoding="utf-8"), "暮色已经降临。\n旅人继续前行。")
-            report, = report_dir.glob("*.txt")
-            report_text = report.read_text(encoding="utf-8-sig")
-            self.assertEqual(report_text.count("书名：novel.txt"), 1)
-            self.assertIn("夕阳已经落下。", report_text)
-            self.assertIn("暮色已经降临。", report_text)
-            self.assertIn("这段风景很长。", report_text)
-            self.assertNotIn("第一章 林间", report_text)
-            self.assertNotIn("旅人继续", report_text)
+            self.assertEqual(result, published)
+            self.assertEqual(list(config.output_dir.glob("*.txt")), [published])
+            self.assertEqual(published.read_text(encoding="utf-8"), expected)
+            self.assertFalse(claimed.exists())
 
     def test_semantic_staged_resume_rechecks_source_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5547,46 +5544,6 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(queued_text.read_text(encoding="utf-8"), "已改正文")
             self.assertEqual(service.stats.failed_total, 0)
             self.assertFalse(service.retry_queue)
-
-    def test_parallel_rewrites_share_daily_report_without_recording_fixed_cleanup(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            config = self.rewrite_config(root)
-            (root / deepseek_client.BANNED_TERMS_FILE_NAME).write_text("赶路=前行\n", encoding="utf-8")
-            books = {"甲.txt": "甲", "乙.txt": "乙"}
-            for name, character in books.items():
-                (config.input_dir / name).write_text(
-                    f"第一章 林间\n{character}走进了村庄。\n随后继续赶路。", encoding="utf-8"
-                )
-            deliveries = threading.Barrier(len(books))
-            logger = logging.getLogger("test-parallel-rewrite-report")
-
-            def send(*_args):
-                deliveries.wait(timeout=10)
-
-            with patch.object(rewrite_processor, "optimize_text", side_effect=lambda **kwargs:
-                              kwargs["text"].replace("走进了村庄", "来到了村里")), \
-                 patch.object(rewrite_processor, "send_file", side_effect=send), \
-                 ThreadPoolExecutor(max_workers=len(books)) as workers:
-                tasks = {
-                    name: workers.submit(rewrite_processor.process_file, config.input_dir / name, config, logger)
-                    for name in books
-                }
-                for name, task in tasks.items():
-                    self.assertEqual(
-                        task.result(timeout=15).read_text(encoding="utf-8"),
-                        f"{books[name]}来到了村里。\n随后继续前行。",
-                    )
-
-            report, = (root / "AI改写记录").glob("*.txt")
-            self.assertRegex(report.name, r"^\d{4}-\d{2}-\d{2}\.txt$")
-            report_text = report.read_text(encoding="utf-8-sig")
-            for name, character in books.items():
-                self.assertEqual(report_text.count(f"书名：{name}"), 1)
-                self.assertIn(f"{character}走进了村庄。", report_text)
-                self.assertIn(f"{character}来到了村里。", report_text)
-            self.assertNotIn("第一章 林间", report_text)
-            self.assertNotIn("随后继续", report_text)
 
     def test_rewrite_monitor_processes_two_books_in_parallel(self):
         with tempfile.TemporaryDirectory() as temporary:
